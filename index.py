@@ -71,11 +71,13 @@ def _handle_degraded_fast_path(user_code, txn_id_input, features, is_api_request
 def handler(event, context):
     # Step 1: Kill Switch — highest precedence, abort all side effects.
     if kill_switch.get_kill_switch_action() == kill_switch.ACTION_HOLD:
-        print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — engine halted.")
+        print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
         return _make_response(200, {
-            "decision": "HOLD",
-            "reason": "GLOBAL_KILL_SWITCH_ENGAGED",
-            "message": "Trade Risk V2 engine halted due to Global Kill Switch.",
+            "user_code": str(user_code) if 'user_code' in locals() else "UNKNOWN",
+            "txn_id": str(txn_id_input) if 'txn_id_input' in locals() else "UNKNOWN",
+            "decision": "PASS", # CRITICAL: Fail-open to protect exchange liquidity
+            "reason": "RISK_ENGINE_KILLED",
+            "message": "Enforcement halted due to Global Kill Switch.",
         })
 
     # Step 2: Circuit Breaker state check (per warm FC instance).
