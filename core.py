@@ -543,19 +543,23 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     headers = {
         "Content-Type": "application/json",
         "X-API-Key": getattr(cfg, 'RISK_GATEWAY_API_KEY', ''),
-        "X-Signature": signature
+        "X-Signature": signature,
+        "Host": "prod-admin-in.onebullex.com"
     }
+    
+    #print(f"[TRADE_RISK_V2_FC] Gateway call headers: {headers}")
 
     is_shadow = not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)
     http_status = None
     response_body = ""
     latency = 0
-
+    
     if not is_shadow:
-        
+        start_t = time.perf_counter() 
         try:
+            print(f"[TRADE_RISK_V2_FC] Gateway call starts at: {start_t}")
             req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
-            start_t = time.perf_counter()
+            
             
             with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
                 http_status = response.getcode()
@@ -563,9 +567,11 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         except urllib.error.HTTPError as e:
             http_status = e.code
             response_body = e.read().decode("utf-8")
+            print(f"[TRADE_RISK_V2_FC] Gateway call failed Here first: {e}")
         except Exception as e:
             http_status = 500
             response_body = str(e)
+            print(f"[TRADE_RISK_V2_FC] Gateway call failed Here: {e}")
         latency = int((time.perf_counter() - start_t) * 1000)
 
     # Write to Audit Log

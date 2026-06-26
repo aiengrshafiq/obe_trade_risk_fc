@@ -15,7 +15,8 @@ ENABLE_AUTOMATED_ACTIONS = os.getenv("ENABLE_AUTOMATED_ACTIONS", "True").lower()
 
 # RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "https://testadmin.1bullex.com/api/risk/action")
 # RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "https://prod-admin-in.onebullex.com/api/risk/action")
-RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "alb-dsg2mz9eq4ip750s4f.ap-northeast-1.alb.aliyuncsslbintl.com/api/risk/action")
-RISK_GATEWAY_API_KEY = os.getenv("RISK_GATEWAY_API_KEY", "70627b55544514b5c57638b7a0e67c3f")
-RISK_GATEWAY_SECRET = os.getenv("RISK_GATEWAY_SECRET", "ceb6dbd900c08db5eb34d9a37868d51c8440071b7b95a19606917ae068a69d37")
+RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "http://alb-dsg2mz9eq4ip750s4f.ap-northeast-1.alb.aliyuncsslbintl.com/api/risk/action")
+
+RISK_GATEWAY_API_KEY = os.getenv("RISK_GATEWAY_API_KEY", "")
+RISK_GATEWAY_SECRET = os.getenv("RISK_GATEWAY_SECRET", "")
 RISK_GATEWAY_TIMEOUT = int(os.getenv("RISK_GATEWAY_TIMEOUT", "3")) # strict 3 second timeout
