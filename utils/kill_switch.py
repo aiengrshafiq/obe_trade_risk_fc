@@ -64,10 +64,11 @@ def get_kill_switch_action() -> str:
 
 
 def _fetch_state_with_retries() -> str | None:
-    for _ in range(OTS_MAX_RETRIES + 1):
+    for attempt in range(OTS_MAX_RETRIES + 1):
         try:
             return _fetch_state_from_ots()
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG_KILL_SWITCH] Attempt {attempt} failed: {repr(e)}")
             continue
     return None
 
@@ -122,7 +123,7 @@ def _get_ots_client():
 
 def _read_global_state_row() -> str:
     client = _get_ots_client()
-    primary_key = [("config_key", GLOBAL_STATE_KEY)]
+    primary_key = [("state_key", GLOBAL_STATE_KEY)]
     _consumed, row, _next_token = client.get_row(
         PHALANX_GLOBAL_STATE_TABLE,
         primary_key,

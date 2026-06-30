@@ -20,3 +20,5 @@ RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "http://alb-dsg2mz9eq4ip750s4f.
 RISK_GATEWAY_API_KEY = os.getenv("RISK_GATEWAY_API_KEY", "")
 RISK_GATEWAY_SECRET = os.getenv("RISK_GATEWAY_SECRET", "")
 RISK_GATEWAY_TIMEOUT = int(os.getenv("RISK_GATEWAY_TIMEOUT", "3")) # strict 3 second timeout
+
+ENABLE_AUTOMATED_ACTIONS = False
