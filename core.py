@@ -518,6 +518,8 @@ def send_lark_notification(data, features):
 # GATEWAY CLIENT — Automated Enforcement + Audit Log
 # ==========================
 def execute_gateway_actions(user_code, rule_result, alert_id):
+    import uuid # Ensure uuid is imported if not already at the top
+
     actions = rule_result.get("enforcement_actions", [])
     api_actions = [a for a in actions if a != "LARK_ALERT"]
 
@@ -546,35 +548,74 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         "X-Signature": signature,
         "Host": "prod-admin-in.onebullex.com"
     }
-    
-    #print(f"[TRADE_RISK_V2_FC] Gateway call headers: {headers}")
 
     is_shadow = not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)
     http_status = None
     response_body = ""
     latency = 0
-    
-    if not is_shadow:
-        start_t = time.perf_counter() 
-        try:
-            # print(f"[TRADE_RISK_V2_FC] Gateway call starts at: {start_t}")
-            req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
-            
-            
-            with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
-                http_status = response.getcode()
-                response_body = response.read().decode("utf-8")
-        except urllib.error.HTTPError as e:
-            http_status = e.code
-            response_body = e.read().decode("utf-8")
-            # print(f"[TRADE_RISK_V2_FC] Gateway call failed Here first: {e}")
-        except Exception as e:
-            http_status = 500
-            response_body = str(e)
-            # print(f"[TRADE_RISK_V2_FC] Gateway call failed Here: {e}")
-        latency = int((time.perf_counter() - start_t) * 1000)
+    skip_api_call = False
 
-    # Write to Audit Log
+    # --- NEW: Deduplication Check ---
+    if not is_shadow:
+        try:
+            conn = get_db_conn()
+            cur = conn.cursor()
+            # Fetch the last 10 successful gateway calls for this user
+            cur.execute("""
+                SELECT payload_sent 
+                FROM rt.risk_trade_action_audit_log 
+                WHERE user_code = %s 
+                  AND http_status_code IN (200, 201)
+                  AND is_shadow_mode = false
+                ORDER BY created_at DESC LIMIT 10
+            """, (str(user_code),))
+            rows = cur.fetchall()
+
+            already_applied = set()
+            for r in rows:
+                try:
+                    past_payload = json.loads(r[0])
+                    for a in past_payload.get("actions", []):
+                        already_applied.add(a.get("action"))
+                except Exception:
+                    pass
+            cur.close()
+
+            # Skip if ALL requested actions already exist in the applied set
+            if all(act in already_applied for act in api_actions):
+                skip_api_call = True
+
+        except Exception as exc:
+            print(f"[TRADE_RISK_V2_FC] Dedup check failed, defaulting to API call: {exc}")
+            try:
+                if conn:
+                    conn.rollback()
+            except Exception:
+                pass
+    # --------------------------------
+
+    if not is_shadow:
+        if skip_api_call:
+            # Bypass external HTTP call, record skipped state
+            http_status = 208 # Already Reported
+            response_body = '{"status": "SKIPPED", "detail": "Identical active restrictions already exist."}'
+            latency = 0
+        else:
+            start_t = time.perf_counter()
+            try:
+                req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
+                with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
+                    http_status = response.getcode()
+                    response_body = response.read().decode("utf-8")
+            except urllib.error.HTTPError as e:
+                http_status = e.code
+                response_body = e.read().decode("utf-8")
+            except Exception as e:
+                http_status = 500
+                response_body = str(e)
+            latency = int((time.perf_counter() - start_t) * 1000)
+
+    # Write to Audit Log (Records true calls, skipped calls, and shadow mode)
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -589,15 +630,14 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         )
         conn.commit()
         cur.close()
-        # print(f"[TRADE_RISK_V2_FC] Audit log written. Shadow Mode: {is_shadow}, HTTP Status: {http_status}")
     except Exception as exc:
-        # print(f"[TRADE_RISK_V2_FC] Failed to write API audit log: {exc}")
         try:
-            conn.rollback()
+            if conn:
+                conn.rollback()
         except Exception:
             pass
 
-    return {"status": http_status, "shadow_mode": is_shadow}
+    return {"status": http_status, "shadow_mode": is_shadow, "skipped": skip_api_call}
 
 
 def should_suppress_lark(user_code, rule_id, action_success, has_automated_actions):
