@@ -68,7 +68,7 @@ def _fetch_state_with_retries() -> str | None:
         try:
             return _fetch_state_from_ots()
         except Exception as e:
-            print(f"[DEBUG_KILL_SWITCH] Attempt {attempt} failed: {repr(e)}")
+            # print(f"[DEBUG_KILL_SWITCH] Attempt {attempt} failed: {repr(e)}")
             continue
     return None
 

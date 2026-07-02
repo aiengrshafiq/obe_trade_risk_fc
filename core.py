@@ -91,10 +91,10 @@ def fetch_trade_features_strict(user_code, txn_id):
     row = cur.fetchone()
     result = dict_factory(cur, row) if row else None
     cur.close()
-    print(
-        f"[TRADE_RISK_V2_FC] DB fetch risk_trade_features_v2 -> "
-        f"{'FOUND' if result else 'NOT FOUND'}"
-    )
+    # print(
+    #     f"[TRADE_RISK_V2_FC] DB fetch risk_trade_features_v2 -> "
+    #     f"{'FOUND' if result else 'NOT FOUND'}"
+    # )
     return result
 
 
@@ -126,7 +126,7 @@ def load_trade_rules():
         _LAST_CACHE_TIME = time.time()
         return rules
     except Exception as exc:
-        print(f"[TRADE_RISK_V2_FC] Error loading rules: {exc}")
+        # print(f"[TRADE_RISK_V2_FC] Error loading rules: {exc}")
         return _RULES_CACHE if _RULES_CACHE else []
 
 
@@ -140,7 +140,7 @@ def load_trade_rules_strict():
     rows = cur.fetchall()
     rules = [dict_factory(cur, row) for row in rows] if rows else []
     cur.close()
-    print(f"[TRADE_RISK_V2_FC] Rules loaded from DB: {len(rules)} active rules")
+    # print(f"[TRADE_RISK_V2_FC] Rules loaded from DB: {len(rules)} active rules")
     return rules
 
 
@@ -186,10 +186,10 @@ def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=Non
         )
         conn.commit()
         cur.close()
-        print(f"[TRADE_RISK_V2_FC] Alert logged: rule={result.get('rule_name')}, action={action_taken}")
+        # print(f"[TRADE_RISK_V2_FC] Alert logged: rule={result.get('rule_name')}, action={action_taken}")
         return alert_id
     except Exception as exc:
-        print(f"[TRADE_RISK_V2_FC] Error logging alert: {exc}")
+        # print(f"[TRADE_RISK_V2_FC] Error logging alert: {exc}")
         try:
             conn.rollback()
         except Exception:
@@ -337,7 +337,7 @@ def evaluate_trade_rules(features, rules):
             expr = rule.get("logic_expression", "")
             tree = _compile_rule_expr(expr)
             if tree and bool(_eval_ast(tree, safe_locals)):
-                print(f"[TRADE_RISK_V2_FC] Rule triggered: #{rule.get('rule_id')} — {rule.get('rule_name')}")
+                # print(f"[TRADE_RISK_V2_FC] Rule triggered: #{rule.get('rule_id')} — {rule.get('rule_name')}")
                 rule_actions = rule.get("enforcement_actions")
                 if isinstance(rule_actions, str):
                     try:
@@ -356,8 +356,8 @@ def evaluate_trade_rules(features, rules):
                     "enforcement_actions": rule_actions,
                 }
         except Exception as exc:
-            print(f"[TRADE_RISK_V2_FC] AST eval failed Rule #{rule.get('rule_id')} "
-                  f"({rule.get('rule_name')}): {exc}")
+            # print(f"[TRADE_RISK_V2_FC] AST eval failed Rule #{rule.get('rule_id')} "
+            #       f"({rule.get('rule_name')}): {exc}")
             continue
 
     return {"triggered": False}
@@ -508,7 +508,7 @@ def send_lark_notification(data, features):
             headers={"Content-Type": "application/json"}
         )
         urllib.request.urlopen(req, timeout=3)
-        print(f"[TRADE_RISK_V2_FC] Lark notification sent successfully")
+        # print(f"[TRADE_RISK_V2_FC] Lark notification sent successfully")
 
     except Exception as e:
         print(f"[TRADE_RISK_V2_FC] Lark notification error: {e}")
@@ -557,7 +557,7 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     if not is_shadow:
         start_t = time.perf_counter() 
         try:
-            print(f"[TRADE_RISK_V2_FC] Gateway call starts at: {start_t}")
+            # print(f"[TRADE_RISK_V2_FC] Gateway call starts at: {start_t}")
             req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
             
             
@@ -567,11 +567,11 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         except urllib.error.HTTPError as e:
             http_status = e.code
             response_body = e.read().decode("utf-8")
-            print(f"[TRADE_RISK_V2_FC] Gateway call failed Here first: {e}")
+            # print(f"[TRADE_RISK_V2_FC] Gateway call failed Here first: {e}")
         except Exception as e:
             http_status = 500
             response_body = str(e)
-            print(f"[TRADE_RISK_V2_FC] Gateway call failed Here: {e}")
+            # print(f"[TRADE_RISK_V2_FC] Gateway call failed Here: {e}")
         latency = int((time.perf_counter() - start_t) * 1000)
 
     # Write to Audit Log
@@ -589,9 +589,9 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         )
         conn.commit()
         cur.close()
-        print(f"[TRADE_RISK_V2_FC] Audit log written. Shadow Mode: {is_shadow}, HTTP Status: {http_status}")
+        # print(f"[TRADE_RISK_V2_FC] Audit log written. Shadow Mode: {is_shadow}, HTTP Status: {http_status}")
     except Exception as exc:
-        print(f"[TRADE_RISK_V2_FC] Failed to write API audit log: {exc}")
+        # print(f"[TRADE_RISK_V2_FC] Failed to write API audit log: {exc}")
         try:
             conn.rollback()
         except Exception:

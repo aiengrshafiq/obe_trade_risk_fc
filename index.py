@@ -27,19 +27,19 @@ def _wait_for_features_with_breaker(user_code, txn_id, max_retries, delay):
                 txn_id,
             )
         except Exception as exc:
-            print(
-                f"[TRADE_RISK_V2_FC] Breaker-wrapped feature fetch error "
-                f"(attempt {attempt + 1}/{max_retries}): {exc}"
-            )
+            # print(
+            #     f"[TRADE_RISK_V2_FC] Breaker-wrapped feature fetch error "
+            #     f"(attempt {attempt + 1}/{max_retries}): {exc}"
+            # )
             time.sleep(delay)
             continue
         if result is circuit_breaker.FAST_PATH_TRIGGER:
             return circuit_breaker.FAST_PATH_TRIGGER
         if result:
             return result
-        print(
-            f"[TRADE_RISK_V2_FC] Feature not ready, attempt {attempt + 1}/{max_retries}"
-        )
+        # print(
+        #     f"[TRADE_RISK_V2_FC] Feature not ready, attempt {attempt + 1}/{max_retries}"
+        # )
         time.sleep(delay)
     return None
 
@@ -53,7 +53,7 @@ def _handle_degraded_fast_path(user_code, txn_id_input, features, is_api_request
     rule_result = degraded_mode.evaluate_trade_fastpath(
         safe_features, user_code, txn_id_input
     )
-    print(f"[TRADE_RISK_V2_FC] Degraded fast-path result: {rule_result}")
+    # print(f"[TRADE_RISK_V2_FC] Degraded fast-path result: {rule_result}")
     return _make_response(
         200,
         {
@@ -71,7 +71,7 @@ def _handle_degraded_fast_path(user_code, txn_id_input, features, is_api_request
 def handler(event, context):
     # Step 1: Kill Switch — highest precedence, abort all side effects.
     if kill_switch.get_kill_switch_action() == kill_switch.ACTION_HOLD:
-        print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
+        # print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
         return _make_response(200, {
             "user_code": str(user_code) if 'user_code' in locals() else "UNKNOWN",
             "txn_id": str(txn_id_input) if 'txn_id_input' in locals() else "UNKNOWN",
@@ -82,7 +82,7 @@ def handler(event, context):
 
     # Step 2: Circuit Breaker state check (per warm FC instance).
     breaker = circuit_breaker.get_breaker()
-    print(f"[TRADE_RISK_V2_FC] Circuit breaker state: {breaker.state}")
+    # print(f"[TRADE_RISK_V2_FC] Circuit breaker state: {breaker.state}")
 
     start_ts     = time.perf_counter()
     user_code    = None
@@ -159,13 +159,13 @@ def handler(event, context):
             user_code    = payload.get("user_code") or payload.get("userId")
             txn_id_input = payload.get("txn_id")    or payload.get("_id") or payload.get("id")
 
-            print(f"[TRADE_RISK_V2_FC] Parsed HTTP API: user={user_code}, txn={txn_id_input}")
+            # print(f"[TRADE_RISK_V2_FC] Parsed HTTP API: user={user_code}, txn={txn_id_input}")
 
         if not user_code or not txn_id_input:
             return _make_response(400, {"error": "Missing user_code or txn_id"})
 
     except Exception as exc:
-        print(f"[TRADE_RISK_V2_FC] FATAL PARSE ERROR: {exc}")
+        # print(f"[TRADE_RISK_V2_FC] FATAL PARSE ERROR: {exc}")
         return _make_response(400, {"error": f"Parse Failed: {str(exc)}"})
 
     # ==========================
@@ -203,10 +203,10 @@ def handler(event, context):
         print("[TRADE_RISK_V2_FC] Rules load tripped breaker — routing to degraded fast-path.")
         return _handle_degraded_fast_path(user_code, txn_id_input, features, is_api_request)
 
-    print(f"[TRADE_RISK_V2_FC] Loaded {len(rules) if rules else 0} active rules")
+    # print(f"[TRADE_RISK_V2_FC] Loaded {len(rules) if rules else 0} active rules")
 
     rule_result = core.evaluate_trade_rules(features, rules)
-    print(f"[TRADE_RISK_V2_FC] Rule Engine Result: {rule_result}")
+    # print(f"[TRADE_RISK_V2_FC] Rule Engine Result: {rule_result}")
 
     # ==========================
     # 4. Alert & Notify
@@ -251,18 +251,19 @@ def handler(event, context):
                 send_lark = True
 
         if send_lark:
-            print(f"[TRADE_RISK_V2_FC] Sending Lark alert. Rule: {rule_result.get('rule_name')}")
+            # print(f"[TRADE_RISK_V2_FC] Sending Lark alert. Rule: {rule_result.get('rule_name')}")
             core.send_lark_notification(response_data, features)
         else:
-            print(f"[TRADE_RISK_V2_FC] Skipping Lark alert (Not requested in rule or decision is PASS)")
+            print(f"[TRADE_RISK_V2_FC] Sending Lark alert skipped.")
+            # print(f"[TRADE_RISK_V2_FC] Skipping Lark alert (Not requested in rule or decision is PASS)")
 
         elapsed = time.perf_counter() - start_ts
-        print(f"[TRADE_RISK_V2_FC] Completed in {elapsed:.3f}s — decision={decision}")
+        # print(f"[TRADE_RISK_V2_FC] Completed in {elapsed:.3f}s — decision={decision}")
         return _make_response(200, response_data)
 
     # No rules triggered
     elapsed = time.perf_counter() - start_ts
-    print(f"[TRADE_RISK_V2_FC] PASS — no rules triggered. Elapsed: {elapsed:.3f}s")
+    # print(f"[TRADE_RISK_V2_FC] PASS — no rules triggered. Elapsed: {elapsed:.3f}s")
     return _make_response(200, {
         "user_code": str(user_code),
         "txn_id":    str(txn_id_input),
