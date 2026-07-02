@@ -214,16 +214,24 @@ def handler(event, context):
     if rule_result.get("triggered"):
         enforcement_actions = rule_result.get("enforcement_actions", [])
 
-        # 1. Log the alert to the DB and get the UUID
+        # 1. Log the alert to the DB and get the UUID (Always happens)
         alert_id = core.log_trade_alert(user_code, txn_id_input, rule_result, features, enforcement_actions)
 
-        # 2. Execute automated API restrictions (Shadow Mode controlled inside core.py)
-        if alert_id and enforcement_actions:
-            #core.execute_gateway_actions(user_code, rule_result, alert_id)
-            try:
-                core.execute_gateway_actions(user_code, rule_result, alert_id)
-            except Exception as e:
-                print(f"[TRADE_RISK_V2_FC] Failed to execute gateway actions: {e}")
+        # 2. Execute automated API restrictions
+        action_success = False
+        has_automated_actions = False
+
+        api_actions = [a for a in enforcement_actions if a != "LARK_ALERT"]
+        if api_actions:
+            has_automated_actions = True
+            if alert_id:
+                try:
+                    gateway_res = core.execute_gateway_actions(user_code, rule_result, alert_id)
+                    # 200/201 means success. If shadow_mode is True, status is likely None, which correctly flags as failure so Lark sends.
+                    if gateway_res and gateway_res.get("status") in (200, 201):
+                        action_success = True
+                except Exception as e:
+                    print(f"[TRADE_RISK_V2_FC] Failed to execute gateway actions: {e}")
 
         response_data = {
             "user_code":  str(user_code),
@@ -242,23 +250,29 @@ def handler(event, context):
         # 3. Smart Lark Routing
         send_lark = False
         if enforcement_actions is not None and isinstance(enforcement_actions, list) and len(enforcement_actions) > 0:
-            # V2 Rule: Only send Lark if explicitly requested
             if "LARK_ALERT" in enforcement_actions:
                 send_lark = True
         else:
-            # Legacy Rule: Send Lark if decision is not PASS
             if decision and decision.strip() not in ("Whitelist / Pass", "PASS"):
                 send_lark = True
 
         if send_lark:
-            # print(f"[TRADE_RISK_V2_FC] Sending Lark alert. Rule: {rule_result.get('rule_name')}")
-            core.send_lark_notification(response_data, features)
+            # 4. The OTS Debounce Cache
+            suppress = core.should_suppress_lark(
+                user_code=str(user_code),
+                rule_id=str(rule_result.get("rule_id", "0")),
+                action_success=action_success,
+                has_automated_actions=has_automated_actions
+            )
+
+            if suppress:
+                print(f"[TRADE_RISK_V2_FC] Lark alert suppressed by OTS debounce cache.")
+            else:
+                core.send_lark_notification(response_data, features)
         else:
-            print(f"[TRADE_RISK_V2_FC] Sending Lark alert skipped.")
-            # print(f"[TRADE_RISK_V2_FC] Skipping Lark alert (Not requested in rule or decision is PASS)")
+            print(f"[TRADE_RISK_V2_FC] Skipping Lark alert (Not requested in rule or decision is PASS)")
 
         elapsed = time.perf_counter() - start_ts
-        # print(f"[TRADE_RISK_V2_FC] Completed in {elapsed:.3f}s — decision={decision}")
         return _make_response(200, response_data)
 
     # No rules triggered

@@ -598,3 +598,81 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
             pass
 
     return {"status": http_status, "shadow_mode": is_shadow}
+
+
+def should_suppress_lark(user_code, rule_id, action_success, has_automated_actions):
+    """
+    Stateful debounce using TableStore (OTS) to prevent Lark alert fatigue.
+    Returns True if Lark should be suppressed, False if it should be sent.
+    """
+    try:
+        import os
+        import time
+        from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
+
+        endpoint = os.environ.get("OTS_ENDPOINT")
+        instance_name = os.environ.get("OTS_INSTANCE")
+        access_key_id = os.environ.get("OTS_ACCESS_KEY_ID")
+        access_key_secret = os.environ.get("OTS_ACCESS_KEY_SECRET")
+
+        if not all([endpoint, instance_name, access_key_id, access_key_secret]):
+            print("[TRADE_RISK_V2_FC] OTS credentials missing, failing open (sending alert).")
+            return False
+
+        client = OTSClient(endpoint, access_key_id, access_key_secret, instance_name)
+        table_name = "phalanx_alert_cache"
+
+        cache_key = f"TR_{user_code}_{rule_id}"
+        primary_key = [("cache_key", cache_key)]
+
+        # Fetch current state
+        try:
+            _, row, _ = client.get_row(table_name, primary_key, ["action_success", "last_alert_ts"])
+        except Exception as e:
+            if "OTSObjectNotExist" in str(e):
+                print(f"[TRADE_RISK_V2_FC] OTS table {table_name} missing. Failing open.")
+                return False
+            row = None
+
+        current_ts = int(time.time())
+        prev_success = False
+        prev_ts = 0
+
+        if row and row.attribute_columns:
+            for name, value, _ in row.attribute_columns:
+                if name == "action_success": prev_success = bool(value)
+                elif name == "last_alert_ts": prev_ts = int(value)
+
+        # Rule 1: If previously mitigated successfully, suppress forever.
+        if prev_success:
+            return True
+
+        # Evaluate current context
+        suppress = False
+        new_success = prev_success
+
+        if has_automated_actions:
+            if action_success:
+                suppress = True  # Automated action worked, discard Lark
+                new_success = True
+            else:
+                suppress = False # Action failed, send alert immediately
+        else:
+            # Lark only - 30 min (1800s) debounce
+            if (current_ts - prev_ts) < 1800:
+                suppress = True
+            else:
+                suppress = False
+
+        # Update state if we are NOT suppressing, OR if we just succeeded
+        if not suppress or new_success:
+            attr_cols = [("last_alert_ts", current_ts), ("action_success", new_success)]
+            row_to_put = Row(primary_key, attr_cols)
+            condition = Condition(RowExistenceExpectation.IGNORE)
+            client.put_row(table_name, row_to_put, condition)
+
+        return suppress
+
+    except Exception as e:
+        print(f"[TRADE_RISK_V2_FC] OTS Debounce error: {e}")
+        return False # Fail open: send alert if cache fails
