@@ -553,69 +553,23 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     http_status = None
     response_body = ""
     latency = 0
-    skip_api_call = False
 
-    # --- NEW: Deduplication Check ---
     if not is_shadow:
+        start_t = time.perf_counter()
         try:
-            conn = get_db_conn()
-            cur = conn.cursor()
-            # Fetch the last 10 successful gateway calls for this user
-            cur.execute("""
-                SELECT payload_sent 
-                FROM rt.risk_trade_action_audit_log 
-                WHERE user_code = %s 
-                  AND http_status_code IN (200, 201)
-                  AND is_shadow_mode = false
-                ORDER BY created_at DESC LIMIT 10
-            """, (str(user_code),))
-            rows = cur.fetchall()
+            req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
+                http_status = response.getcode()
+                response_body = response.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            http_status = e.code
+            response_body = e.read().decode("utf-8")
+        except Exception as e:
+            http_status = 500
+            response_body = str(e)
+        latency = int((time.perf_counter() - start_t) * 1000)
 
-            already_applied = set()
-            for r in rows:
-                try:
-                    past_payload = json.loads(r[0])
-                    for a in past_payload.get("actions", []):
-                        already_applied.add(a.get("action"))
-                except Exception:
-                    pass
-            cur.close()
-
-            # Skip if ALL requested actions already exist in the applied set
-            if all(act in already_applied for act in api_actions):
-                skip_api_call = True
-
-        except Exception as exc:
-            print(f"[TRADE_RISK_V2_FC] Dedup check failed, defaulting to API call: {exc}")
-            try:
-                if conn:
-                    conn.rollback()
-            except Exception:
-                pass
-    # --------------------------------
-
-    if not is_shadow:
-        if skip_api_call:
-            # Bypass external HTTP call, record skipped state
-            http_status = 208 # Already Reported
-            response_body = '{"status": "SKIPPED", "detail": "Identical active restrictions already exist."}'
-            latency = 0
-        else:
-            start_t = time.perf_counter()
-            try:
-                req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
-                with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
-                    http_status = response.getcode()
-                    response_body = response.read().decode("utf-8")
-            except urllib.error.HTTPError as e:
-                http_status = e.code
-                response_body = e.read().decode("utf-8")
-            except Exception as e:
-                http_status = 500
-                response_body = str(e)
-            latency = int((time.perf_counter() - start_t) * 1000)
-
-    # Write to Audit Log (Records true calls, skipped calls, and shadow mode)
+    # Write to Audit Log (Records true calls and shadow mode)
     try:
         conn = get_db_conn()
         cur = conn.cursor()
@@ -638,16 +592,21 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
             pass
 
     newly_applied = False
-    if not is_shadow and not skip_api_call and response_body:
+    if not is_shadow and response_body:
         try:
             resp_json = json.loads(response_body)
-            data_list = resp_json.get("data", [])
-            if isinstance(data_list, list) and any(item.get("result") == "applied" for item in data_list):
-                newly_applied = True
+            # Handle variations in Exchange API response shapes
+            data_list = resp_json.get("results") or resp_json.get("data") or []
+            if isinstance(data_list, list):
+                for item in data_list:
+                    res_val = str(item.get("Result") or item.get("result") or "").lower()
+                    if res_val == "applied":
+                        newly_applied = True
+                        break
         except Exception:
-            pass # If parsing fails, assume false to rely on standard alerting
+            pass # If parsing fails, rely on standard alerting
 
-    return {"status": http_status, "shadow_mode": is_shadow, "skipped": skip_api_call, "newly_applied": newly_applied}
+    return {"status": http_status, "shadow_mode": is_shadow, "skipped": False, "newly_applied": newly_applied}
 
 
 def should_suppress_lark(user_code, rule_id):
