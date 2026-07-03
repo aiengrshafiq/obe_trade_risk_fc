@@ -100,7 +100,7 @@ def handler(event, context):
             if isinstance(event, (bytes, bytearray))
             else (event if isinstance(event, str) else json.dumps(event))
         )
-        print(f"[TRADE_RISK_V2_FC] Raw Event (first 500): {event_str[:500]}")
+        # print(f"[TRADE_RISK_V2_FC] Raw Event (first 500): {event_str[:500]}")
         envelope = json.loads(event_str)
 
         # ---- Kafka Trigger ----
@@ -124,11 +124,11 @@ def handler(event, context):
                 canal_obj = raw_val
 
             canal_type = canal_obj.get("type")
-            print(f"[TRADE_RISK_V2_FC] Canal Event Type: {canal_type}")
+            # print(f"[TRADE_RISK_V2_FC] Canal Event Type: {canal_type}")
 
             # V2 triggers on INSERT only — same as V1 philosophy
             if canal_type != "INSERT":
-                print(f"[TRADE_RISK_V2_FC] Skipping event type: {canal_type}")
+                # print(f"[TRADE_RISK_V2_FC] Skipping event type: {canal_type}")
                 return f"SKIPPED_{canal_type}"
 
             data_row = canal_obj.get("data", [{}])[0]
@@ -140,7 +140,7 @@ def handler(event, context):
             # Block MM_API orders at FC level as well (defense in depth)
             source = data_row.get("source", "")
             if source == "MM_API":
-                print(f"[TRADE_RISK_V2_FC] Skipping MM_API order, txn={txn_id_input}")
+                # print(f"[TRADE_RISK_V2_FC] Skipping MM_API order, txn={txn_id_input}")
                 return "SKIPPED_MM_API"
 
             print(f"[TRADE_RISK_V2_FC] Parsed Kafka: user={user_code}, txn={txn_id_input}, source={source}")
@@ -189,7 +189,7 @@ def handler(event, context):
             {"decision": "PENDING", "message": "Features not ready. Flink may still be processing."}
         )
 
-    print(f"[TRADE_RISK_V2_FC] Features retrieved: {json.dumps(features, default=str)[:800]}")
+    # print(f"[TRADE_RISK_V2_FC] Features retrieved: {json.dumps(features, default=str)[:800]}")
 
     # Ensure identity fields are in features dict for rule evaluation
     features["user_code"] = str(user_code)
@@ -228,7 +228,7 @@ def handler(event, context):
                 try:
                     gateway_res = core.execute_gateway_actions(user_code, rule_result, alert_id)
                     # 200/201 means success. If shadow_mode is True, status is likely None, which correctly flags as failure so Lark sends.
-                    if gateway_res and gateway_res.get("status") in (200, 201):
+                    if gateway_res and gateway_res.get("status") in (200, 201, 208):
                         action_success = True
                 except Exception as e:
                     print(f"[TRADE_RISK_V2_FC] Failed to execute gateway actions: {e}")
