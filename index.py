@@ -213,64 +213,60 @@ def handler(event, context):
     # ==========================
     if rule_result.get("triggered"):
         enforcement_actions = rule_result.get("enforcement_actions", [])
-
-        # 1. Log the alert to the DB and get the UUID (Always happens)
         alert_id = core.log_trade_alert(user_code, txn_id_input, rule_result, features, enforcement_actions)
 
-        # 2. Execute automated API restrictions
-        action_success = False
-        has_automated_actions = False
-
         api_actions = [a for a in enforcement_actions if a != "LARK_ALERT"]
-        if api_actions:
-            has_automated_actions = True
-            if alert_id:
-                try:
-                    gateway_res = core.execute_gateway_actions(user_code, rule_result, alert_id)
-                    # 200/201 means success. If shadow_mode is True, status is likely None, which correctly flags as failure so Lark sends.
-                    if gateway_res and gateway_res.get("status") in (200, 201, 208):
-                        action_success = True
-                except Exception as e:
-                    print(f"[TRADE_RISK_V2_FC] Failed to execute gateway actions: {e}")
+        has_automated_actions = bool(api_actions)
+
+        api_success = False
+        newly_applied = False
+        api_skipped = False
+
+        if has_automated_actions and alert_id:
+            try:
+                gateway_res = core.execute_gateway_actions(user_code, rule_result, alert_id)
+                if gateway_res:
+                    status = gateway_res.get("status")
+                    api_success = status in (200, 201, 208)
+                    newly_applied = gateway_res.get("newly_applied", False)
+                    api_skipped = gateway_res.get("skipped", False)
+            except Exception as e:
+                print(f"[TRADE_RISK_V2_FC] Failed to execute gateway actions: {e}")
 
         response_data = {
-            "user_code":  str(user_code),
-            "txn_id":     str(txn_id_input),
-            "decision":   rule_result.get("decision"),
-            "rule_hit":   rule_result.get("rule_name"),
-            "alert_type": rule_result.get("alert_type"),
-            "narrative":  rule_result.get("narrative"),
-            "root_user_code":    features.get("root_user_code", "N/A"),
-            "inviter_user_code": features.get("inviter_user_code", "N/A"),
-            "enforcement_actions": enforcement_actions
+            "user_code": str(user_code), "txn_id": str(txn_id_input), "decision": rule_result.get("decision"),
+            "rule_hit": rule_result.get("rule_name"), "alert_type": rule_result.get("alert_type"),
+            "narrative": rule_result.get("narrative"), "root_user_code": features.get("root_user_code", "N/A"),
+            "inviter_user_code": features.get("inviter_user_code", "N/A"), "enforcement_actions": enforcement_actions
         }
 
+        # Alex's Target State Logic
+        must_alert_now = False
+        use_debounce = False
+
         decision = rule_result.get("decision", "")
+        is_whitelist = decision.strip() in ("Whitelist / Pass", "PASS")
 
-        # 3. Smart Lark Routing
-        send_lark = False
-        if enforcement_actions is not None and isinstance(enforcement_actions, list) and len(enforcement_actions) > 0:
-            if "LARK_ALERT" in enforcement_actions:
-                send_lark = True
-        else:
-            if decision and decision.strip() not in ("Whitelist / Pass", "PASS"):
-                send_lark = True
+        if not is_whitelist:
+            if has_automated_actions:
+                if not api_success:
+                    must_alert_now = True # Rule 3: Always alert on API failure
+                elif newly_applied:
+                    must_alert_now = True # Rule 2: Always alert when NEW restriction is applied
+                else:
+                    use_debounce = True   # Rule 4: Action was successful but skipped/duplicate, use 30m debounce
+            else:
+                use_debounce = True       # Rule 4: Lark-only rule, use 30m debounce
 
-        if send_lark:
-            # 4. The OTS Debounce Cache
-            suppress = core.should_suppress_lark(
-                user_code=str(user_code),
-                rule_id=str(rule_result.get("rule_id", "0")),
-                action_success=action_success,
-                has_automated_actions=has_automated_actions
-            )
-
+        if must_alert_now:
+            core.send_lark_notification(response_data, features)
+            core.update_lark_debounce_timestamp(str(user_code), str(rule_result.get("rule_id", "0")))
+        elif use_debounce:
+            suppress = core.should_suppress_lark(str(user_code), str(rule_result.get("rule_id", "0")))
             if suppress:
-                print(f"[TRADE_RISK_V2_FC] Lark alert suppressed by OTS debounce cache.")
+                print("[TRADE_RISK_V2_FC] Lark alert suppressed by OTS debounce cache.")
             else:
                 core.send_lark_notification(response_data, features)
-        else:
-            print(f"[TRADE_RISK_V2_FC] Skipping Lark alert (Not requested in rule or decision is PASS)")
 
         elapsed = time.perf_counter() - start_ts
         return _make_response(200, response_data)

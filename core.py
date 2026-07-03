@@ -528,7 +528,7 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
 
     payload = {
         "uid": int(user_code) if str(user_code).isdigit() else user_code,
-        "source_order_id": f"phalanx-{alert_id}",
+        "source_order_id": f"phalanx-lock-{user_code}-{rule_result.get('rule_id', '0')}",
         "alert_type": rule_result.get("alert_type", "Unknown"),
         "actions": [{"action": act, "reason": rule_result.get("rule_name", "Risk Engine Trigger"), "expire_seconds": 0} for act in api_actions]
     }
@@ -637,82 +637,65 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         except Exception:
             pass
 
-    return {"status": http_status, "shadow_mode": is_shadow, "skipped": skip_api_call}
-
-
-def should_suppress_lark(user_code, rule_id, action_success, has_automated_actions):
-    """
-    Stateful debounce using TableStore (OTS) to prevent Lark alert fatigue.
-    Returns True if Lark should be suppressed, False if it should be sent.
-    """
-    try:
-        import os
-        import time
-        from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
-
-        endpoint = os.environ.get("OTS_ENDPOINT")
-        instance_name = os.environ.get("OTS_INSTANCE")
-        access_key_id = os.environ.get("OTS_ACCESS_KEY_ID")
-        access_key_secret = os.environ.get("OTS_ACCESS_KEY_SECRET")
-
-        if not all([endpoint, instance_name, access_key_id, access_key_secret]):
-            print("[TRADE_RISK_V2_FC] OTS credentials missing, failing open (sending alert).")
-            return False
-
-        client = OTSClient(endpoint, access_key_id, access_key_secret, instance_name)
-        table_name = "phalanx_alert_cache"
-
-        cache_key = f"TR_{user_code}_{rule_id}"
-        primary_key = [("cache_key", cache_key)]
-
-        # Fetch current state
+    newly_applied = False
+    if not is_shadow and not skip_api_call and response_body:
         try:
-            _, row, _ = client.get_row(table_name, primary_key, ["action_success", "last_alert_ts"])
-        except Exception as e:
-            if "OTSObjectNotExist" in str(e):
-                print(f"[TRADE_RISK_V2_FC] OTS table {table_name} missing. Failing open.")
-                return False
-            row = None
+            resp_json = json.loads(response_body)
+            data_list = resp_json.get("data", [])
+            if isinstance(data_list, list) and any(item.get("result") == "applied" for item in data_list):
+                newly_applied = True
+        except Exception:
+            pass # If parsing fails, assume false to rely on standard alerting
+
+    return {"status": http_status, "shadow_mode": is_shadow, "skipped": skip_api_call, "newly_applied": newly_applied}
+
+
+def should_suppress_lark(user_code, rule_id):
+    """Strict 30-minute (1800s) rolling debounce using OTS."""
+    try:
+        import os, time
+        from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
+        endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
+        ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
+        if not all([endpoint, instance_name, ak_id, ak_secret]): return False
+
+        client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
+        table_name = "phalanx_alert_cache"
+        primary_key = [("cache_key", f"TR_{user_code}_{rule_id}")]
+
+        try: _, row, _ = client.get_row(table_name, primary_key, ["last_alert_ts"])
+        except Exception: row = None
 
         current_ts = int(time.time())
-        prev_success = False
-        prev_ts = 0
+        prev_ts = int(row.attribute_columns[0][1]) if row and row.attribute_columns else 0
 
-        if row and row.attribute_columns:
-            for name, value, _ in row.attribute_columns:
-                if name == "action_success": prev_success = bool(value)
-                elif name == "last_alert_ts": prev_ts = int(value)
-
-        # Rule 1: If previously mitigated successfully, suppress forever.
-        if prev_success:
+        if (current_ts - prev_ts) < 1800:
             return True
 
-        # Evaluate current context
-        suppress = False
-        new_success = prev_success
-
-        if has_automated_actions:
-            if action_success:
-                suppress = True  # Automated action worked, discard Lark
-                new_success = True
-            else:
-                suppress = False # Action failed, send alert immediately
-        else:
-            # Lark only - 30 min (1800s) debounce
-            if (current_ts - prev_ts) < 1800:
-                suppress = True
-            else:
-                suppress = False
-
-        # Update state if we are NOT suppressing, OR if we just succeeded
-        if not suppress or new_success:
-            attr_cols = [("last_alert_ts", current_ts), ("action_success", new_success)]
-            row_to_put = Row(primary_key, attr_cols)
-            condition = Condition(RowExistenceExpectation.IGNORE)
-            client.put_row(table_name, row_to_put, condition)
-
-        return suppress
-
+        client.put_row(table_name, Row(primary_key, [("last_alert_ts", current_ts)]), Condition(RowExistenceExpectation.IGNORE))
+        return False
     except Exception as e:
         print(f"[TRADE_RISK_V2_FC] OTS Debounce error: {e}")
-        return False # Fail open: send alert if cache fails
+        return False # Fail open
+
+
+def update_lark_debounce_timestamp(user_code, rule_id):
+    """Unconditionally updates the last_alert_ts in OTS after a forced alert."""
+    try:
+        import os, time
+        from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
+        endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
+        ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
+        if not all([endpoint, instance_name, ak_id, ak_secret]): return
+
+        client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
+        table_name = "phalanx_alert_cache"
+        primary_key = [("cache_key", f"TR_{user_code}_{rule_id}")]
+
+        client.put_row(
+            table_name,
+            Row(primary_key, [("last_alert_ts", int(time.time()))]),
+            Condition(RowExistenceExpectation.IGNORE)
+        )
+    except Exception as e:
+        print(f"[TRADE_RISK_V2_FC] Failed to update OTS timestamp: {e}")
