@@ -86,19 +86,19 @@ class CircuitBreaker:
 
         now = time.monotonic()
         if now < _NEXT_PROBE_TIME:
-            print(
-                "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] OPEN — rejecting DB call "
-                f"(probe in {(_NEXT_PROBE_TIME - now):.1f}s)"
-            )
+            # print(
+            #     "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] OPEN — rejecting DB call "
+            #     f"(probe in {(_NEXT_PROBE_TIME - now):.1f}s)"
+            # )
             return FAST_PATH_TRIGGER
 
         if not await self._probe_db_health():
             _STATE = STATE_OPEN
             _NEXT_PROBE_TIME = time.monotonic() + OPEN_COOLDOWN
-            print(
-                "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe failed — "
-                f"remaining OPEN for {OPEN_COOLDOWN}s"
-            )
+            # print(
+            #     "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe failed — "
+            #     f"remaining OPEN for {OPEN_COOLDOWN}s"
+            # )
             return FAST_PATH_TRIGGER
 
         _transition_to_closed()
@@ -123,10 +123,10 @@ class CircuitBreaker:
 
             _FAIL_COUNT += 1
             _LAST_FAILURE_TIME = time.monotonic()
-            print(
-                "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] DB failure "
-                f"{_FAIL_COUNT}/{FAILURE_THRESHOLD}: {exc}"
-            )
+            # print(
+            #     "[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] DB failure "
+            #     f"{_FAIL_COUNT}/{FAILURE_THRESHOLD}: {exc}"
+            # )
 
             if _FAIL_COUNT >= FAILURE_THRESHOLD:
                 _STATE = STATE_OPEN
@@ -147,10 +147,10 @@ class CircuitBreaker:
                 asyncio.to_thread(core.ping_db),
                 timeout=PROBE_TIMEOUT_S,
             )
-            print("[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe succeeded")
+            # print("[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe succeeded")
             return True
         except Exception as exc:
-            print(f"[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe failed: {exc}")
+            # print(f"[TRADE_RISK_V2_FC][CIRCUIT_BREAKER] Out-of-band probe failed: {exc}")
             return False
 
 
