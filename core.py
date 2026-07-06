@@ -526,9 +526,24 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     if not api_actions or not alert_id:
         return None
 
+    # ── Idempotency key ──────────────────────────────────────────────
+    # The Exchange dedups on (action + source + source_order_id) [DB UNIQUE index].
+    # We therefore make source_order_id STABLE per (engine, user) — NOT per rule.
+    # Consequence: if two different rules both enforce e.g. WITHDRAW_LIMIT on the
+    # same user, both POSTs carry the same source_order_id, so the Exchange keeps
+    # ONE lock for that action (second returns result:"updated"). This is exactly
+    # the risk-team spec: "alert per rule, but only one lock per (user, action)."
+    #
+    # ENGINE is namespaced into the id to prevent cross-engine collisions:
+    # Trade rule_id=2 and Withdraw rule_id=2 previously produced the SAME id.
+    # This FC is the Trade engine, so ENGINE = "TR". The Withdraw FC's copy of
+    # this function must set ENGINE = "WD" (only that one line differs).
+    ENGINE = "TR"
+    source_order_id = f"phalanx-{ENGINE}-{user_code}"
+
     payload = {
         "uid": int(user_code) if str(user_code).isdigit() else user_code,
-        "source_order_id": f"phalanx-lock-{user_code}-{rule_result.get('rule_id', '0')}",
+        "source_order_id": source_order_id,
         "alert_type": rule_result.get("alert_type", "Unknown"),
         "actions": [{"action": act, "reason": rule_result.get("rule_name", "Risk Engine Trigger"), "expire_seconds": 0} for act in api_actions]
     }
@@ -577,10 +592,10 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         cur.execute(
             """
             INSERT INTO rt.risk_trade_action_audit_log
-            (audit_id, alert_id, user_code, rule_id, api_endpoint, payload_sent, hmac_signature, http_status_code, response_body, latency_ms, is_shadow_mode, created_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+            (audit_id, alert_id, user_code, rule_id, source_order_id, api_endpoint, payload_sent, hmac_signature, http_status_code, response_body, latency_ms, is_shadow_mode, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
-            (audit_id, alert_id, str(user_code), rule_result.get("rule_id", 0), getattr(cfg, 'RISK_GATEWAY_URL', ''), json.dumps(payload), signature, http_status, response_body, latency, is_shadow)
+            (audit_id, alert_id, str(user_code), rule_result.get("rule_id", 0), source_order_id, getattr(cfg, 'RISK_GATEWAY_URL', ''), json.dumps(payload), signature, http_status, response_body, latency, is_shadow)
         )
         conn.commit()
         cur.close()
