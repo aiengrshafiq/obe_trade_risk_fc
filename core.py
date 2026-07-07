@@ -517,6 +517,46 @@ def send_lark_notification(data, features):
 # ==========================
 # GATEWAY CLIENT — Automated Enforcement + Audit Log
 # ==========================
+def _fetch_active_locked_actions(user_code):
+    """
+    Best-effort read of the user's CURRENTLY-ACTIVE restriction actions from the
+    synced lock table (merchent_bullex.risk_permission_lock in Hologres).
+
+    Returns a set() of action strings that are active right now, OR None if the
+    state could not be determined (query error). Callers MUST treat None as
+    "unknown → apply anyway" — this is an optimization to suppress redundant
+    locks, NEVER a gate. The Exchange's own (action+source+source_order_id)
+    idempotency remains the hard backstop. Fail-SAFE: on any doubt we enforce.
+
+    Note: the synced table is a replica and can lag. We only ever use a POSITIVE
+    hit (row present + ACTIVE + unexpired) to SKIP an action. Absence never
+    forces a skip, so replica lag can at worst cause a redundant (idempotent)
+    call — never a missed restriction.
+    """
+    try:
+        import time as _t
+        now_ms = int(_t.time() * 1000)
+        conn = get_db_conn()                 # shared Hologres connection (do NOT close)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT action
+            FROM merchent_bullex.risk_permission_lock
+            WHERE uid = %s
+              AND source = 'PHALANX'
+              AND status = 'ACTIVE'
+              AND (expire_at = 0 OR expire_at > %s)
+            """,
+            (int(user_code) if str(user_code).isdigit() else user_code, now_ms),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        return {r[0] for r in rows}
+    except Exception as exc:
+        print(f"[TRADE_RISK_V2_FC] Active-lock lookup failed (fail-safe: will apply): {exc}")
+        return None  # unknown → caller applies (fail-safe)
+
+
 def execute_gateway_actions(user_code, rule_result, alert_id):
     import uuid # Ensure uuid is imported if not already at the top
 
@@ -525,6 +565,29 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
 
     if not api_actions or not alert_id:
         return None
+
+    # ── Idempotency pre-check (Elvis's spec) ──────────────────────────
+    # "If the user already has an active restriction of the same type, a later
+    #  trigger should not create a new restriction." We read the synced lock
+    #  table and drop actions that are already ACTIVE for this user.
+    #  CRITICAL: this is fail-safe. If state is unknown (None), we apply all
+    #  actions and let the Exchange idempotency dedup. A stale replica can only
+    #  cause a redundant idempotent call, never a skipped restriction.
+    #  This also self-heals manual releases: once an operator releases a lock in
+    #  the Admin UI, it is no longer ACTIVE here, so the next trigger re-applies.
+    active_locked = _fetch_active_locked_actions(user_code)
+    if active_locked:
+        remaining = [a for a in api_actions if a not in active_locked]
+        skipped_already_active = [a for a in api_actions if a in active_locked]
+        if skipped_already_active:
+            print(f"[TRADE_RISK_V2_FC] Skipping already-active actions {skipped_already_active} for user {user_code}")
+        api_actions = remaining
+
+    # If every requested action is already active, there is nothing to send.
+    # Report skipped=True so the caller does NOT raise a new must-alert-now.
+    if not api_actions:
+        print(f"[TRADE_RISK_V2_FC] All requested actions already active for user {user_code} — no gateway call.")
+        return {"status": 208, "shadow_mode": False, "skipped": True, "newly_applied": False}
 
     # ── Idempotency key ──────────────────────────────────────────────
     # The Exchange dedups on (action + source + source_order_id) [DB UNIQUE index].
