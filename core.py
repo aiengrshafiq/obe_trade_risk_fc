@@ -517,44 +517,63 @@ def send_lark_notification(data, features):
 # ==========================
 # GATEWAY CLIENT — Automated Enforcement + Audit Log
 # ==========================
-def _fetch_active_locked_actions(user_code):
+def _pick_source_order_id(user_code, action, engine="TR"):
     """
-    Best-effort read of the user's CURRENTLY-ACTIVE restriction actions from the
-    synced lock table (merchent_bullex.risk_permission_lock in Hologres).
+    Choose a source_order_id for (user, action) that is:
+      - STABLE while a lock is currently ACTIVE  -> re-fires update in place (no pileup)
+      - FRESH after the previous lock is RELEASED/EXPIRED -> creates a NEW active lock
+        (fixes "cannot re-apply after manual unlock")
 
-    Returns a set() of action strings that are active right now, OR None if the
-    state could not be determined (query error). Callers MUST treat None as
-    "unknown → apply anyway" — this is an optimization to suppress redundant
-    locks, NEVER a gate. The Exchange's own (action+source+source_order_id)
-    idempotency remains the hard backstop. Fail-SAFE: on any doubt we enforce.
+    Mechanism (no live RDS; reads the ~4s Hologres replica, FAIL-OPEN toward enforcement):
+      base = phalanx-{ENGINE}-{user}-{action}
+      Read the newest lock row for (uid, action, source=PHALANX) whose id starts with base.
+        - If newest is ACTIVE  -> reuse its exact source_order_id  (stable, in-place update)
+        - else (RELEASED/EXPIRED/none) -> bump to base-v{N+1}       (new active lock)
+      If the replica cannot be read -> return a fresh time-suffixed id (fail toward a NEW
+      lock). Worst case under replica lag = one extra active row (bounded, operator-clearable,
+      and self-healed by the Exchange's own idempotency when two calls pick the same version).
+      This is the SAFE failure direction: we never suppress a needed lock.
 
-    Note: the synced table is a replica and can lag. We only ever use a POSITIVE
-    hit (row present + ACTIVE + unexpired) to SKIP an action. Absence never
-    forces a skip, so replica lag can at worst cause a redundant (idempotent)
-    call — never a missed restriction.
+    The Exchange dedups on (action, source, source_order_id) [confirmed UNIQUE index], so a
+    reused id updates in place and a bumped id creates a new row — exactly what we want.
     """
+    base = f"phalanx-{engine}-{user_code}-{action}"
     try:
-        import time as _t
-        now_ms = int(_t.time() * 1000)
-        conn = get_db_conn()                 # shared Hologres connection (do NOT close)
+        conn = get_db_conn()                 # shared Hologres conn (do NOT close)
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT action
+            SELECT status, source_order_id
             FROM merchent_bullex.risk_permission_lock
-            WHERE uid = %s
-              AND source = 'PHALANX'
-              AND status = 'ACTIVE'
-              AND (expire_at = 0 OR expire_at > %s)
+            WHERE uid = %s AND action = %s AND source = 'PHALANX'
+              AND (source_order_id = %s OR source_order_id LIKE %s)
+            ORDER BY create_at DESC
+            LIMIT 1
             """,
-            (int(user_code) if str(user_code).isdigit() else user_code, now_ms),
+            (int(user_code) if str(user_code).isdigit() else user_code, action, base, base + '-v%'),
         )
-        rows = cur.fetchall()
+        row = cur.fetchone()
         cur.close()
-        return {r[0] for r in rows}
+
+        if row is None:
+            return base + "-v1"                      # never locked before
+        status, newest_id = row[0], row[1]
+        if str(status).upper() == "ACTIVE":
+            return newest_id                          # reuse -> in-place update, no pileup
+        # newest is RELEASED/EXPIRED -> start a new lifecycle
+        # derive N from the suffix if present, else start at 2
+        n = 1
+        if isinstance(newest_id, str) and newest_id.startswith(base + "-v"):
+            try:
+                n = int(newest_id.rsplit("-v", 1)[1])
+            except (ValueError, IndexError):
+                n = 1
+        return f"{base}-v{n + 1}"
     except Exception as exc:
-        print(f"[TRADE_RISK_V2_FC] Active-lock lookup failed (fail-safe: will apply): {exc}")
-        return None  # unknown → caller applies (fail-safe)
+        # FAIL-OPEN: replica unreadable -> mint a fresh, unique-ish id so the lock still applies.
+        # Time suffix guarantees a new active lock; the Exchange idempotency dedups exact repeats.
+        print(f"[TRADE_RISK_V2_FC] Version lookup failed (fail-open, applying fresh lock): {exc}")
+        return f"{base}-t{int(time.time())}"
 
 
 def execute_gateway_actions(user_code, rule_result, alert_id):
@@ -566,50 +585,57 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     if not api_actions or not alert_id:
         return None
 
-    # ── Idempotency pre-check (Elvis's spec) ──────────────────────────
-    # "If the user already has an active restriction of the same type, a later
-    #  trigger should not create a new restriction." We read the synced lock
-    #  table and drop actions that are already ACTIVE for this user.
-    #  CRITICAL: this is fail-safe. If state is unknown (None), we apply all
-    #  actions and let the Exchange idempotency dedup. A stale replica can only
-    #  cause a redundant idempotent call, never a skipped restriction.
-    #  This also self-heals manual releases: once an operator releases a lock in
-    #  the Admin UI, it is no longer ACTIVE here, so the next trigger re-applies.
-    active_locked = _fetch_active_locked_actions(user_code)
-    if active_locked:
-        remaining = [a for a in api_actions if a not in active_locked]
-        skipped_already_active = [a for a in api_actions if a in active_locked]
-        if skipped_already_active:
-            print(f"[TRADE_RISK_V2_FC] Skipping already-active actions {skipped_already_active} for user {user_code}")
-        api_actions = remaining
+    ENGINE = "TR"  # this is the Trade FC; the Withdraw FC's copy sets "WD"
 
-    # If every requested action is already active, there is nothing to send.
-    # Report skipped=True so the caller does NOT raise a new must-alert-now.
-    if not api_actions:
-        print(f"[TRADE_RISK_V2_FC] All requested actions already active for user {user_code} — no gateway call.")
-        return {"status": 208, "shadow_mode": False, "skipped": True, "newly_applied": False}
+    # Per-action versioned idempotency id. Each action gets its own id keyed to its own
+    # lock lifecycle, so releasing one action and re-triggering re-locks ONLY that action,
+    # and a still-active action is updated in place (never stacked).
+    per_action = []
+    for act in api_actions:
+        soid = _pick_source_order_id(user_code, act, ENGINE)
+        per_action.append({"action": act, "source_order_id": soid,
+                           "reason": rule_result.get("rule_name", "Risk Engine Trigger"),
+                           "expire_seconds": 0})
 
-    # ── Idempotency key ──────────────────────────────────────────────
-    # The Exchange dedups on (action + source + source_order_id) [DB UNIQUE index].
-    # We therefore make source_order_id STABLE per (engine, user) — NOT per rule.
-    # Consequence: if two different rules both enforce e.g. WITHDRAW_LIMIT on the
-    # same user, both POSTs carry the same source_order_id, so the Exchange keeps
-    # ONE lock for that action (second returns result:"updated"). This is exactly
-    # the risk-team spec: "alert per rule, but only one lock per (user, action)."
-    #
-    # ENGINE is namespaced into the id to prevent cross-engine collisions:
-    # Trade rule_id=2 and Withdraw rule_id=2 previously produced the SAME id.
-    # This FC is the Trade engine, so ENGINE = "TR". The Withdraw FC's copy of
-    # this function must set ENGINE = "WD" (only that one line differs).
-    ENGINE = "TR"
-    source_order_id = f"phalanx-{ENGINE}-{user_code}"
+    # The Exchange API takes ONE source_order_id per request. Because each action may now
+    # carry a DIFFERENT version, we group actions by their chosen source_order_id and send
+    # one request per distinct id. (Usually they share one id, so this is a single call.)
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for pa in per_action:
+        groups[pa["source_order_id"]].append(pa)
 
-    payload = {
-        "uid": int(user_code) if str(user_code).isdigit() else user_code,
-        "source_order_id": source_order_id,
-        "alert_type": rule_result.get("alert_type", "Unknown"),
-        "actions": [{"action": act, "reason": rule_result.get("rule_name", "Risk Engine Trigger"), "expire_seconds": 0} for act in api_actions]
-    }
+    # Aggregate result across grouped calls (preserves the newly_applied/alert semantics).
+    agg_status = None
+    agg_newly_applied = False
+    agg_response_bodies = []
+    any_sent = False
+
+    for soid, acts in groups.items():
+        payload = {
+            "uid": int(user_code) if str(user_code).isdigit() else user_code,
+            "source_order_id": soid,
+            "alert_type": rule_result.get("alert_type", "Unknown"),
+            "actions": [{"action": a["action"], "reason": a["reason"], "expire_seconds": a["expire_seconds"]} for a in acts]
+        }
+        res = _post_gateway_group(user_code, rule_result, alert_id, payload, soid)
+        if res is None:
+            continue
+        any_sent = True
+        if res.get("status") is not None:
+            agg_status = res["status"] if agg_status is None else agg_status
+        if res.get("newly_applied"):
+            agg_newly_applied = True
+        if res.get("response_body"):
+            agg_response_bodies.append(res["response_body"])
+
+    if not any_sent:
+        return None
+    return {"status": agg_status, "shadow_mode": (not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)),
+            "skipped": False, "newly_applied": agg_newly_applied}
+
+
+def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_id):
 
     # CRITICAL: Must be deterministic for HMAC signature matching
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode("utf-8")
@@ -684,7 +710,7 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
         except Exception:
             pass # If parsing fails, rely on standard alerting
 
-    return {"status": http_status, "shadow_mode": is_shadow, "skipped": False, "newly_applied": newly_applied}
+    return {"status": http_status, "shadow_mode": is_shadow, "skipped": False, "newly_applied": newly_applied, "response_body": response_body}
 
 
 def should_suppress_lark(user_code, rule_id):
