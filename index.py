@@ -69,6 +69,9 @@ def _handle_degraded_fast_path(user_code, txn_id_input, features, is_api_request
     )
 
 def handler(event, context):
+
+    
+    
     # Step 1: Kill Switch — highest precedence, abort all side effects.
     if kill_switch.get_kill_switch_action() == kill_switch.ACTION_HOLD:
         # print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
@@ -245,6 +248,7 @@ def handler(event, context):
         use_debounce = False
 
         decision = rule_result.get("decision", "")
+        already_active = gateway_res.get("already_active", False)
         is_whitelist = decision.strip() in ("Whitelist / Pass", "PASS")
 
         if not is_whitelist:
@@ -253,6 +257,8 @@ def handler(event, context):
                     must_alert_now = True # Rule 3: Always alert on API failure
                 elif newly_applied:
                     must_alert_now = True # Rule 2: Always alert when NEW restriction is applied
+                elif already_active:
+                    use_debounce = True            # already restricted → debounce (and suppress)
                 else:
                     use_debounce = True   # Rule 4: Action was successful but skipped/duplicate, use 30m debounce
             else:

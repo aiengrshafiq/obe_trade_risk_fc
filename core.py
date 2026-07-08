@@ -608,6 +608,7 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
     # Aggregate result across grouped calls (preserves the newly_applied/alert semantics).
     agg_status = None
     agg_newly_applied = False
+    already_active = False
     agg_response_bodies = []
     any_sent = False
 
@@ -628,11 +629,14 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
             agg_newly_applied = True
         if res.get("response_body"):
             agg_response_bodies.append(res["response_body"])
+        
+        if res.get("already_active"):
+            already_active = True
 
     if not any_sent:
         return None
     return {"status": agg_status, "shadow_mode": (not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)),
-            "skipped": False, "newly_applied": agg_newly_applied}
+            "skipped": False, "newly_applied": agg_newly_applied,"already_active": already_active}
 
 
 def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_id):
@@ -696,21 +700,18 @@ def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_
             pass
 
     newly_applied = False
+    already_active = False
     if not is_shadow and response_body:
         try:
             resp_json = json.loads(response_body)
-            # Handle variations in Exchange API response shapes
             data_list = resp_json.get("results") or resp_json.get("data") or []
-            if isinstance(data_list, list):
-                for item in data_list:
-                    res_val = str(item.get("Result") or item.get("result") or "").lower()
-                    if res_val == "applied":
-                        newly_applied = True
-                        break
+            results = [str(i.get("Result") or i.get("result") or "").lower() for i in data_list]
+            newly_applied = any(r == "applied" for r in results)
+            already_active = bool(results) and all(r in ("updated",) for r in results)
         except Exception:
-            pass # If parsing fails, rely on standard alerting
+            pass
 
-    return {"status": http_status, "shadow_mode": is_shadow, "skipped": False, "newly_applied": newly_applied, "response_body": response_body}
+    return {"status": http_status, "shadow_mode": is_shadow, "skipped": False, "newly_applied": newly_applied,"already_active": already_active, "response_body": response_body}
 
 
 def should_suppress_lark(user_code, rule_id):
@@ -762,3 +763,40 @@ def update_lark_debounce_timestamp(user_code, rule_id):
         )
     except Exception as e:
         print(f"[TRADE_RISK_V2_FC] Failed to update OTS timestamp: {e}")
+
+
+def test_ots_connection():
+    try:
+        import os
+        from tablestore import OTSClient
+
+        endpoint = os.environ.get("OTS_ENDPOINT")
+        instance = os.environ.get("OTS_INSTANCE")
+        ak_id = os.environ.get("OTS_ACCESS_KEY_ID")
+        ak_secret = os.environ.get("OTS_ACCESS_KEY_SECRET")
+
+        print("Endpoint :", endpoint)
+        print("Instance :", instance)
+        print("AK ID    :", "YES" if ak_id else "NO")
+        print("AK Secret:", "YES" if ak_secret else "NO")
+
+        if not all([endpoint, instance, ak_id, ak_secret]):
+            print("❌ Missing environment variables")
+            return
+
+        client = OTSClient(endpoint, ak_id, ak_secret, instance)
+
+        table_name = "phalanx_alert_cache"
+        primary_key = [("cache_key", "__health_check__")]
+
+        try:
+            _, row, _ = client.get_row(table_name, primary_key)
+            print("✅ OTS Reachable")
+            print("Row Exists:", row is not None)
+        except Exception as e:
+            print("❌ Connected to OTS but read failed")
+            print(type(e).__name__, str(e))
+
+    except Exception as e:
+        print("❌ Failed to create OTS client")
+        print(type(e).__name__, str(e))
