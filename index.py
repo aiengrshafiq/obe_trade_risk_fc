@@ -224,6 +224,7 @@ def handler(event, context):
         api_success = False
         newly_applied = False
         api_skipped = False
+        gateway_res = {}
 
         if has_automated_actions and alert_id:
             try:
@@ -253,7 +254,7 @@ def handler(event, context):
 
         if not is_whitelist:
             if has_automated_actions:
-                if not api_success:
+                if not api_success and not is_shadow:
                     must_alert_now = True # Rule 3: Always alert on API failure
                 elif newly_applied:
                     must_alert_now = True # Rule 2: Always alert when NEW restriction is applied
