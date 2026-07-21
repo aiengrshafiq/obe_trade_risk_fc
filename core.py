@@ -8,7 +8,12 @@ import urllib.request
 import urllib.error
 import ast
 import uuid
+import math
 from functools import lru_cache
+from tablestore import OTSClient, RowExistenceExpectation, Condition, SingleColumnCondition, ComparatorType, Row, LogicalOperator, CompositeColumnCondition
+import tablestore
+import os
+#from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
 
 import config as cfg
 
@@ -147,46 +152,103 @@ def load_trade_rules_strict():
 # ==========================
 # ALERT LOGGING — V2 Table
 # ==========================
+# def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=None):
+#     try:
+#         conn = get_db_conn()
+#         cur  = conn.cursor()
+
+#         alert_id     = str(uuid.uuid4())
+#         action_taken = result.get("decision", "HOLD")
+
+#         # Include correlated UIDs only for HOLD ALL decisions
+#         correlated_uids = (
+#             features.get("correlated_account_uids", "")
+#             if "ALL" in action_taken
+#             else ""
+#         )
+
+#         # V2: inserts into risk_trade_alerts_v2
+#         insert_sql = """
+#             INSERT INTO rt.risk_trade_alerts_v2
+#             (alert_id, user_code, txn_id, correlated_uids, rule_id, rule_name,
+#              action_taken, feature_snapshot, status, enforcement_actions_taken, detected_at)
+#             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+#         """
+#         cur.execute(
+#             insert_sql,
+#             (
+#                 alert_id,
+#                 str(user_code),
+#                 str(txn_id),
+#                 correlated_uids,
+#                 result.get("rule_id"),
+#                 result.get("rule_name"),
+#                 action_taken,
+#                 json.dumps(features, default=str),
+#                 "ACTIVE",
+#                 json.dumps(enforcement_actions) if enforcement_actions else '[]',
+#             )
+#         )
+#         conn.commit()
+#         cur.close()
+#         # print(f"[TRADE_RISK_V2_FC] Alert logged: rule={result.get('rule_name')}, action={action_taken}")
+#         return alert_id
+#     except Exception as exc:
+#         # print(f"[TRADE_RISK_V2_FC] Error logging alert: {exc}")
+#         try:
+#             conn.rollback()
+#         except Exception:
+#             pass
+#         return None
+
 def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=None):
     try:
         conn = get_db_conn()
         cur  = conn.cursor()
 
-        alert_id     = str(uuid.uuid4())
+        is_tiered = result.get("is_tiered", False)
+        current_tier = result.get("current_tier", 0.0)
+        rule_id = result.get("rule_id")
+
+        if is_tiered:
+            # Deterministic UUID5 for Idempotent Insert (Claude's mandate)
+            namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+            alert_id = str(uuid.uuid5(namespace, f"{user_code}_{rule_id}_{current_tier}"))
+        else:
+            alert_id = str(uuid.uuid4())
+            
         action_taken = result.get("decision", "HOLD")
 
-        # Include correlated UIDs only for HOLD ALL decisions
         correlated_uids = (
             features.get("correlated_account_uids", "")
-            if "ALL" in action_taken
-            else ""
+            if "ALL" in action_taken else ""
         )
 
-        # V2: inserts into risk_trade_alerts_v2
+        # UPSERT logic (ON CONFLICT DO NOTHING requires a UNIQUE constraint in Postgres, 
+        # Hologres supports this via Primary Key on (alert_id))
         insert_sql = """
             INSERT INTO rt.risk_trade_alerts_v2
             (alert_id, user_code, txn_id, correlated_uids, rule_id, rule_name,
-             action_taken, feature_snapshot, status, enforcement_actions_taken, detected_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
+             action_taken, feature_snapshot, status, enforcement_actions_taken, detected_at, tier_triggered, trigger_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, 1)
+            ON CONFLICT (alert_id) DO NOTHING
         """
         cur.execute(
             insert_sql,
             (
-                alert_id,
-                str(user_code),
-                str(txn_id),
-                correlated_uids,
-                result.get("rule_id"),
-                result.get("rule_name"),
-                action_taken,
-                json.dumps(features, default=str),
-                "ACTIVE",
+                alert_id, str(user_code), str(txn_id), correlated_uids, rule_id, result.get("rule_name"),
+                action_taken, json.dumps(features, default=str), "ACTIVE",
                 json.dumps(enforcement_actions) if enforcement_actions else '[]',
+                current_tier if is_tiered else None
             )
         )
         conn.commit()
         cur.close()
-        # print(f"[TRADE_RISK_V2_FC] Alert logged: rule={result.get('rule_name')}, action={action_taken}")
+        
+        # FINAL STEP: Now that DB write is safe, advance the OTS High-Water Mark (Scenario B Completion)
+        if is_tiered:
+            _advance_ots_high_water_mark(user_code, rule_id, current_tier)
+
         return alert_id
     except Exception as exc:
         # print(f"[TRADE_RISK_V2_FC] Error logging alert: {exc}")
@@ -195,6 +257,34 @@ def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=Non
         except Exception:
             pass
         return None
+
+def _advance_ots_high_water_mark(user_code, rule_id, current_tier):
+    """Called only AFTER Hologres durably stores the alert."""
+    import os, time
+    from tablestore import OTSClient, Row, Condition, RowExistenceExpectation, SingleColumnCondition, ComparatorType, UpdateRowItem
+    
+    endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
+    ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
+    if not all([endpoint, instance_name, ak_id, ak_secret]): return
+    
+    client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
+    table_name = "phalanx_alert_cache"
+    primary_key = [("cache_key", f"TIER_{user_code}_{rule_id}")]
+    
+    try:
+        # We don't know the exact old HWM here without a read, but because we only get here 
+        # if evaluate_trade_rules passed Scenario B, we know we are advancing.
+        # We simply CAS ensure high_water_tier < current_tier
+        cond = Condition(RowExistenceExpectation.EXPECT_EXIST, SingleColumnCondition("high_water_tier", current_tier, ComparatorType.LESS_THAN))
+        update_of = UpdateRowItem()
+        update_of.put([("high_water_tier", current_tier), ("last_evidence_ts", int(time.time()))])
+        # Note: We reset count to 1 on a tier advance, but only if the tier is actually less.
+        update_of.put([("trigger_count", 1)])
+        
+        client.update_row(table_name, Row(primary_key), cond, update_of)
+    except Exception as e:
+        # print(f"[TRADE_RISK_V2_FC] Failed to advance HWM in OTS: {e}")
+        pass
 
 
 # ==========================
@@ -321,46 +411,211 @@ def _eval_ast(node: ast.AST, ctx: dict):
 
     return False
 
+def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_val, features):
+    """
+    Implements the Claude-reviewed state machine for Tiered Triggers.
+    Returns (should_alert, current_tier, hwm_tier).
+    """
+    import os
+    from tablestore import OTSClient
+    
+    endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
+    ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
+    
+    if not all([endpoint, instance_name, ak_id, ak_secret]):
+        print("[TRADE_RISK_V2_FC] Missing OTS creds for Tiering. Failing Open (Alerting).")
+        return True, 0, 0
+
+    client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
+    table_name = "phalanx_alert_cache" # Reuse existing table, different key prefix
+    primary_key = [("cache_key", f"TIER_{user_code}_{rule_id}")]
+    
+    # Calculate the absolute tier (e.g., 1020 / 500 = 2.0 * 500 = 1000)
+    current_tier = float(math.floor(float(feature_val) / float(step_size)) * float(step_size))
+    now_ts = int(time.time())
+
+    try:
+        _, row, _ = client.get_row(table_name, primary_key, ["high_water_tier", "trigger_count", "last_evidence_ts"])
+    except Exception as e:
+        print(f"[TRADE_RISK_V2_FC] OTS get_row failed: {e}. Failing Open.")
+        return True, current_tier, 0
+
+    # ==========================================
+    # SCENARIO A: Cold Start (Silent Seeding)
+    # ==========================================
+    if row is None:
+        try:
+            client.put_row(
+                table_name,
+                Row(primary_key, [
+                    ("high_water_tier", current_tier),
+                    ("trigger_count", 1),
+                    ("last_evidence_ts", now_ts)
+                ]),
+                Condition(RowExistenceExpectation.EXPECT_NOT_EXIST)
+            )
+            # print(f"[TRADE_RISK_V2_FC] Seeded Tier {current_tier} for {user_code}_{rule_id}. Suppressing.")
+        except Exception:
+            # If EXPECT_NOT_EXIST fails, someone beat us to seeding. Fall through to read again next time.
+            pass
+        return False, current_tier, current_tier
+
+    # Extract existing state
+    attrs = {k: v for k, v, _ in row.attribute_columns} if row.attribute_columns else {}
+    hwm_tier = float(attrs.get("high_water_tier", 0.0))
+    last_ts = int(attrs.get("last_evidence_ts", 0))
+
+    # ==========================================
+    # SCENARIO B: Crossing a New Tier
+    # ==========================================
+    if current_tier > hwm_tier:
+        # 1. We return True to let the FC know it MUST alert. 
+        # The FC will handle the idempotent DB insert FIRST, then call a callback to update OTS.
+        return True, current_tier, hwm_tier
+
+    # ==========================================
+    # SCENARIO C: Dip / Same Tier (Repeated Trigger)
+    # ==========================================
+    else:
+        # Atomic Increment (Claude's fix for the Lost Update race)
+        try:
+            update_of = tablestore.UpdateRowItem(tablestore.ReturnType.RT_AFTER_MODIFY)
+            update_of.increment([("trigger_count", 1)])
+            
+            # If 60s has passed, we also CAS the timestamp forward so we can flush to Hologres
+            should_flush = (now_ts - last_ts) >= 60
+            if should_flush:
+                update_of.put([("last_evidence_ts", now_ts)])
+                cond = Condition(RowExistenceExpectation.EXPECT_EXIST, SingleColumnCondition("last_evidence_ts", last_ts, ComparatorType.EQUAL))
+            else:
+                cond = Condition(RowExistenceExpectation.EXPECT_EXIST)
+                
+            _, return_row, _ = client.update_row(table_name, Row(primary_key), cond, update_of)
+            
+            if should_flush and return_row:
+                # We won the 60s CAS. Read the exact incremented count and flush to Hologres.
+                new_attrs = {k: v for k, v, _ in return_row.attribute_columns}
+                exact_count = int(new_attrs.get("trigger_count", 1))
+                
+                # Deterministic UUID5 based on the High Water Mark tier
+                namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
+                alert_id = str(uuid.uuid5(namespace, f"{user_code}_{rule_id}_{hwm_tier}"))
+                
+                conn = get_db_conn()
+                cur = conn.cursor()
+                cur.execute(
+                    """
+                    UPDATE rt.risk_trade_alerts_v2 
+                    SET trigger_count = %s, feature_snapshot = %s, updated_at = NOW() 
+                    WHERE alert_id = %s
+                    """,
+                    (exact_count, json.dumps(features, default=str), alert_id)
+                )
+                conn.commit()
+                cur.close()
+                # print(f"[TRADE_RISK_V2_FC] Flushed trigger_count={exact_count} to Hologres for Tier {hwm_tier}")
+
+        except Exception as e:
+            # print(f"[TRADE_RISK_V2_FC] Scenario C update failed: {e}")
+            pass
+            
+        return False, current_tier, hwm_tier
 
 def evaluate_trade_rules(features, rules):
     """
-    Evaluates all active rules in priority order.
-    Returns first triggered rule result or triggered=False.
+    Evaluates all active rules. Supports standard and Tiered triggers.
     """
     safe_locals = {
         k: _normalize_feature_value(k, v)
         for k, v in (features or {}).items()
     }
 
+    user_code = features.get("user_code")
+
     for rule in rules or []:
         try:
             expr = rule.get("logic_expression", "")
             tree = _compile_rule_expr(expr)
+            
             if tree and bool(_eval_ast(tree, safe_locals)):
-                # print(f"[TRADE_RISK_V2_FC] Rule triggered: #{rule.get('rule_id')} — {rule.get('rule_name')}")
+                
+                # Check for Tiered Trigger Configuration
+                target_feature = rule.get("tier_target_feature")
+                step_size = _to_number(rule.get("tier_step_size"))
+                
+                rule_id = rule.get("rule_id")
+                current_tier = 0
+                
+                if target_feature and step_size and step_size > 0:
+                    feature_val = safe_locals.get(target_feature, 0.0)
+                    should_alert, current_tier, _ = _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_val, features)
+                    
+                    if not should_alert:
+                        continue # Suppress alert, move to next rule
+                
                 rule_actions = rule.get("enforcement_actions")
                 if isinstance(rule_actions, str):
-                    try:
-                        rule_actions = json.loads(rule_actions)
-                    except:
-                        rule_actions = []
+                    try: rule_actions = json.loads(rule_actions)
+                    except: rule_actions = []
                 elif not isinstance(rule_actions, list):
                     rule_actions = []
+                    
                 return {
                     "triggered":  True,
                     "decision":   (rule.get("action") or "Human Monitoring").strip(),
-                    "rule_id":    rule.get("rule_id"),
+                    "rule_id":    rule_id,
                     "rule_name":  rule.get("rule_name"),
                     "alert_type": rule.get("alert_type", "Unknown Type"),
-                    "narrative":  f"[Rule #{rule.get('rule_id')}] {rule.get('narrative')}",
+                    "narrative":  f"[Rule #{rule_id}] {rule.get('narrative')}",
                     "enforcement_actions": rule_actions,
+                    # Pass the tier info down so log_trade_alert can use it
+                    "is_tiered": bool(target_feature),
+                    "current_tier": current_tier
                 }
         except Exception as exc:
-            # print(f"[TRADE_RISK_V2_FC] AST eval failed Rule #{rule.get('rule_id')} "
-            #       f"({rule.get('rule_name')}): {exc}")
             continue
 
     return {"triggered": False}
+
+# def evaluate_trade_rules(features, rules):
+#     """
+#     Evaluates all active rules in priority order.
+#     Returns first triggered rule result or triggered=False.
+#     """
+#     safe_locals = {
+#         k: _normalize_feature_value(k, v)
+#         for k, v in (features or {}).items()
+#     }
+
+#     for rule in rules or []:
+#         try:
+#             expr = rule.get("logic_expression", "")
+#             tree = _compile_rule_expr(expr)
+#             if tree and bool(_eval_ast(tree, safe_locals)):
+#                 # print(f"[TRADE_RISK_V2_FC] Rule triggered: #{rule.get('rule_id')} — {rule.get('rule_name')}")
+#                 rule_actions = rule.get("enforcement_actions")
+#                 if isinstance(rule_actions, str):
+#                     try:
+#                         rule_actions = json.loads(rule_actions)
+#                     except:
+#                         rule_actions = []
+#                 elif not isinstance(rule_actions, list):
+#                     rule_actions = []
+#                 return {
+#                     "triggered":  True,
+#                     "decision":   (rule.get("action") or "Human Monitoring").strip(),
+#                     "rule_id":    rule.get("rule_id"),
+#                     "rule_name":  rule.get("rule_name"),
+#                     "alert_type": rule.get("alert_type", "Unknown Type"),
+#                     "narrative":  f"[Rule #{rule.get('rule_id')}] {rule.get('narrative')}",
+#                     "enforcement_actions": rule_actions,
+#                 }
+#         except Exception as exc:
+#             # print(f"[TRADE_RISK_V2_FC] AST eval failed Rule #{rule.get('rule_id')} "
+#             #       f"({rule.get('rule_name')}): {exc}")
+#             continue
+
+#     return {"triggered": False}
 
 
 # ==========================
@@ -717,8 +972,7 @@ def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_
 def should_suppress_lark(user_code, rule_id):
     """Strict 30-minute (1800s) rolling debounce using OTS."""
     try:
-        import os, time
-        from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
+        
         endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
         ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
         if not all([endpoint, instance_name, ak_id, ak_secret]): return False
