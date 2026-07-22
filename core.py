@@ -252,6 +252,7 @@ def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=Non
         return alert_id
     except Exception as exc:
         # print(f"[TRADE_RISK_V2_FC] Error logging alert: {exc}")
+        print(f"[URGENT DEBUG] Error logging alert to Database: {exc}")
         try:
             conn.rollback()
         except Exception:
@@ -573,6 +574,7 @@ def evaluate_trade_rules(features, rules):
                     "current_tier": current_tier
                 }
         except Exception as exc:
+            print(f"[URGENT DEBUG] AST eval failed for Rule #{rule.get('rule_id')}: {exc}")
             continue
 
     return {"triggered": False}
