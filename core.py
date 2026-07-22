@@ -231,7 +231,7 @@ def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=Non
             (alert_id, user_code, txn_id, correlated_uids, rule_id, rule_name,
              action_taken, feature_snapshot, status, enforcement_actions_taken, detected_at, tier_triggered, trigger_count)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), %s, 1)
-            ON CONFLICT (alert_id) DO NOTHING
+            ON CONFLICT (user_code, alert_id) DO NOTHING
         """
         cur.execute(
             insert_sql,
@@ -259,33 +259,68 @@ def log_trade_alert(user_code, txn_id, result, features, enforcement_actions=Non
             pass
         return None
 
-def _advance_ots_high_water_mark(user_code, rule_id, current_tier):
-    """Called only AFTER Hologres durably stores the alert."""
+def _advance_ots_high_water_mark(user_code, rule_id, new_tier):
     import os, time
-    from tablestore import OTSClient, Row, Condition, RowExistenceExpectation, SingleColumnCondition, ComparatorType, UpdateRowItem
-    
-    endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
-    ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
-    if not all([endpoint, instance_name, ak_id, ak_secret]): return
-    
-    client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
-    table_name = "phalanx_alert_cache"
-    primary_key = [("cache_key", f"TIER_{user_code}_{rule_id}")]
-    
+    import tablestore
+ 
     try:
-        # We don't know the exact old HWM here without a read, but because we only get here 
-        # if evaluate_trade_rules passed Scenario B, we know we are advancing.
-        # We simply CAS ensure high_water_tier < current_tier
-        cond = Condition(RowExistenceExpectation.EXPECT_EXIST, SingleColumnCondition("high_water_tier", current_tier, ComparatorType.LESS_THAN))
-        update_of = UpdateRowItem()
-        update_of.put([("high_water_tier", current_tier), ("last_evidence_ts", int(time.time()))])
-        # Note: We reset count to 1 on a tier advance, but only if the tier is actually less.
-        update_of.put([("trigger_count", 1)])
+        endpoint = os.environ.get("OTS_ENDPOINT")
+        instance_name = os.environ.get("OTS_INSTANCE")
+        ak_id = os.environ.get("OTS_ACCESS_KEY_ID")
+        ak_secret = os.environ.get("OTS_ACCESS_KEY_SECRET")
+        if not all([endpoint, instance_name, ak_id, ak_secret]):
+            return
+            
+        client = tablestore.OTSClient(endpoint, ak_id, ak_secret, instance_name)
         
-        client.update_row(table_name, Row(primary_key), cond, update_of)
+        table_name = "phalanx_alert_cache"
+        primary_key = [("cache_key", f"TIER_{user_code}_{rule_id}")]
+        
+        update_attrs = {
+            'PUT': [
+                ("high_water_tier", float(new_tier)),
+                ("trigger_count", 1),
+                ("last_evidence_ts", int(time.time()))
+            ]
+        }
+        
+        row = tablestore.Row(primary_key, update_attrs)
+        condition = tablestore.Condition(tablestore.RowExistenceExpectation.IGNORE)
+        
+        client.update_row(table_name, row, condition)
+        
     except Exception as e:
-        # print(f"[TRADE_RISK_V2_FC] Failed to advance HWM in OTS: {e}")
-        pass
+        print(f"[URGENT DEBUG] Failed to advance HWM in OTS: {repr(e)}")
+
+
+# def _advance_ots_high_water_mark(user_code, rule_id, current_tier):
+#     """Called only AFTER Hologres durably stores the alert."""
+#     import os, time
+#     from tablestore import OTSClient, Row, Condition, RowExistenceExpectation, SingleColumnCondition, ComparatorType, UpdateRowItem
+    
+#     endpoint, instance_name = os.environ.get("OTS_ENDPOINT"), os.environ.get("OTS_INSTANCE")
+#     ak_id, ak_secret = os.environ.get("OTS_ACCESS_KEY_ID"), os.environ.get("OTS_ACCESS_KEY_SECRET")
+#     if not all([endpoint, instance_name, ak_id, ak_secret]): return
+    
+#     client = OTSClient(endpoint, ak_id, ak_secret, instance_name)
+#     table_name = "phalanx_alert_cache"
+#     primary_key = [("cache_key", f"TIER_{user_code}_{rule_id}")]
+    
+#     try:
+#         # We don't know the exact old HWM here without a read, but because we only get here 
+#         # if evaluate_trade_rules passed Scenario B, we know we are advancing.
+#         # We simply CAS ensure high_water_tier < current_tier
+#         cond = Condition(RowExistenceExpectation.EXPECT_EXIST, SingleColumnCondition("high_water_tier", current_tier, ComparatorType.LESS_THAN))
+#         update_of = UpdateRowItem()
+#         update_of.put([("high_water_tier", current_tier), ("last_evidence_ts", int(time.time()))])
+#         # Note: We reset count to 1 on a tier advance, but only if the tier is actually less.
+#         update_of.put([("trigger_count", 1)])
+        
+#         client.update_row(table_name, Row(primary_key), cond, update_of)
+#     except Exception as e:
+#         print(f"[TRADE_RISK_V2_FC] Failed to advance HWM in OTS: {e}")
+#         print(f"[URGENT DEBUG] Failed to advance HWM in OTS: {repr(e)}")
+#         pass
 
 
 # ==========================
@@ -439,6 +474,7 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
         _, row, _ = client.get_row(table_name, primary_key, ["high_water_tier", "trigger_count", "last_evidence_ts"])
     except Exception as e:
         print(f"[TRADE_RISK_V2_FC] OTS get_row failed: {e}. Failing Open.")
+        print(f"[URGENT DEBUG] Scenario C OTS update failed: {repr(e)}")
         return True, current_tier, 0
 
     # ==========================================
@@ -455,8 +491,9 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
                 ]),
                 Condition(RowExistenceExpectation.EXPECT_NOT_EXIST)
             )
-            # print(f"[TRADE_RISK_V2_FC] Seeded Tier {current_tier} for {user_code}_{rule_id}. Suppressing.")
+            print(f"[TRADE_RISK_V2_FC] Seeded Tier {current_tier} for {user_code}_{rule_id}. Suppressing.")
         except Exception:
+            print(f"[TRADE_RISK_V2_FC] If EXPECT_NOT_EXIST fails, someone beat us to seeding. Fall through to read again next time.")
             # If EXPECT_NOT_EXIST fails, someone beat us to seeding. Fall through to read again next time.
             pass
         return False, current_tier, current_tier
@@ -478,25 +515,41 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
     # SCENARIO C: Dip / Same Tier (Repeated Trigger)
     # ==========================================
     else:
-        # Atomic Increment (Claude's fix for the Lost Update race)
+        # Atomic Increment (Python SDK Dict syntax)
         try:
-            update_of = tablestore.UpdateRowItem(tablestore.ReturnType.RT_AFTER_MODIFY)
-            update_of.increment([("trigger_count", 1)])
+            import tablestore
+            update_attrs = {
+                'INCREMENT': [("trigger_count", 1)]
+            }
             
-            # If 60s has passed, we also CAS the timestamp forward so we can flush to Hologres
             should_flush = (now_ts - last_ts) >= 60
             if should_flush:
-                update_of.put([("last_evidence_ts", now_ts)])
-                cond = Condition(RowExistenceExpectation.EXPECT_EXIST, SingleColumnCondition("last_evidence_ts", last_ts, ComparatorType.EQUAL))
+                update_attrs['PUT'] = [("last_evidence_ts", now_ts)]
+                cond = tablestore.Condition(
+                    tablestore.RowExistenceExpectation.EXPECT_EXIST, 
+                    tablestore.SingleColumnCondition("last_evidence_ts", last_ts, tablestore.ComparatorType.EQUAL)
+                )
             else:
-                cond = Condition(RowExistenceExpectation.EXPECT_EXIST)
+                cond = tablestore.Condition(tablestore.RowExistenceExpectation.EXPECT_EXIST)
                 
-            _, return_row, _ = client.update_row(table_name, Row(primary_key), cond, update_of)
+            row_to_update = tablestore.Row(primary_key, update_attrs)
+            
+            # Python SDK update_row returns (consumed, return_row)
+            _, return_row = client.update_row(
+                table_name, 
+                row_to_update, 
+                cond, 
+                return_type=tablestore.ReturnType.RT_AFTER_MODIFY
+            )
             
             if should_flush and return_row:
                 # We won the 60s CAS. Read the exact incremented count and flush to Hologres.
-                new_attrs = {k: v for k, v, _ in return_row.attribute_columns}
-                exact_count = int(new_attrs.get("trigger_count", 1))
+                exact_count = 1
+                if return_row.attribute_columns:
+                    for k, v, _ in return_row.attribute_columns:
+                        if k == "trigger_count":
+                            exact_count = int(v)
+                            break
                 
                 # Deterministic UUID5 based on the High Water Mark tier
                 namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
@@ -514,11 +567,9 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
                 )
                 conn.commit()
                 cur.close()
-                # print(f"[TRADE_RISK_V2_FC] Flushed trigger_count={exact_count} to Hologres for Tier {hwm_tier}")
 
         except Exception as e:
-            # print(f"[TRADE_RISK_V2_FC] Scenario C update failed: {e}")
-            pass
+            print(f"[URGENT DEBUG] Scenario C OTS update failed: {repr(e)}")
             
         return False, current_tier, hwm_tier
 
