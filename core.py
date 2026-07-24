@@ -694,7 +694,10 @@ def send_lark_notification(data, features, alert_id=None):
         alert_group_name = data.get("alert_group_name")
         
         # 1. Resolve Webhook Routing
-        webhook_url = cfg.ALERT_GROUPS.get(alert_group_name) or cfg.ALERT_GROUPS.get("DEFAULT")
+        webhook_url = cfg.LARK_WEBHOOK_URL
+        if hasattr(cfg, 'ALERT_GROUPS'):
+            webhook_url = cfg.ALERT_GROUPS.get(alert_group_name) or cfg.ALERT_GROUPS.get("DEFAULT")
+            
         if not webhook_url:
             return
 
@@ -719,7 +722,6 @@ def send_lark_notification(data, features, alert_id=None):
                     val = data.get(key, "N/A")
                 return str(val)
                 
-            # Safely replace ${field_name} with snapshot values
             final_rendered_msg = re.sub(r'\$\{([^}]+)\}', replacer, template_text)
             
             card_content = {
@@ -744,10 +746,24 @@ def send_lark_notification(data, features, alert_id=None):
             actions_str = ", ".join(actions_list) if actions_list else "None"
             correlated = features.get("correlated_account_uids", "None") if "ALL" in decision else "N/A"
             
-            vol = float(features.get("trading_volume", 0.0) or 0.0)
-            pnl = float(features.get("net_pnl", 0.0) or 0.0)
+            vol              = float(features.get("trading_volume", 0.0) or 0.0)
+            pnl              = float(features.get("net_pnl", 0.0) or 0.0)
+            fee              = float(features.get("trading_fees_paid", 0.0) or 0.0)
+            offset           = float(features.get("offset_ratio", 0.0) or 0.0)
+            rebate           = float(features.get("total_rebate", 0.0) or 0.0)
+            net_benefit      = float(features.get("net_benefit", 0.0) or 0.0)
+            cancel_rate      = float(features.get("order_cancel_rate", 0.0) or 0.0)
+            margin_util      = float(features.get("margin_utilization_ratio", 0.0) or 0.0)
+            opp_conc         = float(features.get("opposite_party_concentration", 0.0) or 0.0)
+            funding_income   = float(features.get("funding_fee_income", 0.0) or 0.0)
+            cashback         = float(features.get("cashback_received", 0.0) or 0.0)
+            cancel_ms        = float(features.get("avg_order_lifetime_ms", 0.0) or 0.0)
+            current_symbol   = features.get("current_symbol_id", "N/A")
+            current_leverage = features.get("current_leverage", "N/A")
+            current_side     = {1: "Buy", 2: "Sell"}.get(features.get("current_order_side"), "N/A")
+            wallet_bal       = float(features.get("wallet_balance", 0.0) or 0.0)
             
-            final_rendered_msg = f"Legacy fallback triggered for {rule_name}. Vol: {vol}, PnL: {pnl}"
+            final_rendered_msg = f"Legacy fallback triggered for {rule_name}."
             
             card_content = {
                 "msg_type": "interactive",
@@ -762,6 +778,8 @@ def send_lark_notification(data, features, alert_id=None):
                             "tag": "div",
                             "fields": [
                                 {"is_short": True,  "text": {"tag": "lark_md", "content": f"**User:**\n{data.get('user_code')}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Root User:**\n{data.get('root_user_code', 'N/A')}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Inviter:**\n{data.get('inviter_user_code', 'N/A')}"}},
                                 {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Txn ID:**\n{data.get('txn_id')}"}},
                             ]
                         },
@@ -774,7 +792,52 @@ def send_lark_notification(data, features, alert_id=None):
                             ]
                         },
                         {"tag": "hr"},
-                        {"tag": "div", "text": {"tag": "lark_md", "content": f"**Triggered Rule:**\n{rule_name}\n\n**Reasoning:**\n{data.get('narrative', '')}"}}
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Symbol ID:**\n{current_symbol}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Side:**\n{current_side}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Leverage:**\n{current_leverage}x"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Wallet Bal:**\n{wallet_bal:,.2f}"}},
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Vol (USDT):**\n{vol:,.2f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Net P&L:**\n{pnl:,.2f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Fee Paid:**\n{fee:,.2f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Net Benefit:**\n{net_benefit:,.2f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Offset Ratio:**\n{offset:.4f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Total Rebate:**\n{rebate:,.2f}"}},
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Cancel Rate:**\n{cancel_rate:.2%}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Avg Cancel ms:**\n{cancel_ms:,.0f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Margin Util:**\n{margin_util:.2%}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Opp Party Conc:**\n{opp_conc:.2%}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Funding Income:**\n{funding_income:,.2f}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Cashback:**\n{cashback:,.2f}"}},
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "text": {"tag": "lark_md", "content": f"**Correlated UIDs:**\n{correlated}"}
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "text": {
+                                "tag": "lark_md",
+                                "content": f"**Triggered Rule:**\n{rule_name}\n\n**Reasoning:**\n{data.get('narrative', '')}"
+                            }
+                        }
                     ]
                 }
             }
