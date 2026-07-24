@@ -74,7 +74,7 @@ def handler(event, context):
     
     # Step 1: Kill Switch — highest precedence, abort all side effects.
     if kill_switch.get_kill_switch_action() == kill_switch.ACTION_HOLD:
-        # print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
+        print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
         return _make_response(200, {
             "user_code": str(user_code) if 'user_code' in locals() else "UNKNOWN",
             "txn_id": str(txn_id_input) if 'txn_id_input' in locals() else "UNKNOWN",
@@ -103,7 +103,7 @@ def handler(event, context):
             if isinstance(event, (bytes, bytearray))
             else (event if isinstance(event, str) else json.dumps(event))
         )
-        # print(f"[TRADE_RISK_V2_FC] Raw Event (first 500): {event_str[:500]}")
+        print(f"[TRADE_RISK_V2_FC] Raw Event (first 500): {event_str[:500]}")
         envelope = json.loads(event_str)
 
         # ---- Kafka Trigger ----
@@ -127,11 +127,11 @@ def handler(event, context):
                 canal_obj = raw_val
 
             canal_type = canal_obj.get("type")
-            # print(f"[TRADE_RISK_V2_FC] Canal Event Type: {canal_type}")
+            print(f"[TRADE_RISK_V2_FC] Canal Event Type: {canal_type}")
 
             # V2 triggers on INSERT only — same as V1 philosophy
             if canal_type != "INSERT":
-                # print(f"[TRADE_RISK_V2_FC] Skipping event type: {canal_type}")
+                print(f"[TRADE_RISK_V2_FC] Skipping event type: {canal_type}")
                 return f"SKIPPED_{canal_type}"
 
             data_row = canal_obj.get("data", [{}])[0]
@@ -143,7 +143,7 @@ def handler(event, context):
             # Block MM_API orders at FC level as well (defense in depth)
             source = data_row.get("source", "")
             if source == "MM_API":
-                # print(f"[TRADE_RISK_V2_FC] Skipping MM_API order, txn={txn_id_input}")
+                print(f"[TRADE_RISK_V2_FC] Skipping MM_API order, txn={txn_id_input}")
                 return "SKIPPED_MM_API"
 
             print(f"[TRADE_RISK_V2_FC] Parsed Kafka: user={user_code}, txn={txn_id_input}, source={source}")
@@ -241,7 +241,9 @@ def handler(event, context):
             "user_code": str(user_code), "txn_id": str(txn_id_input), "decision": rule_result.get("decision"),
             "rule_hit": rule_result.get("rule_name"), "alert_type": rule_result.get("alert_type"),
             "narrative": rule_result.get("narrative"), "root_user_code": features.get("root_user_code", "N/A"),
-            "inviter_user_code": features.get("inviter_user_code", "N/A"), "enforcement_actions": enforcement_actions
+            "inviter_user_code": features.get("inviter_user_code", "N/A"), "enforcement_actions": enforcement_actions,
+            "alert_group_name": rule_result.get("alert_group_name"),
+            "template_text": rule_result.get("template_text"),
         }
 
         # Alex's Target State Logic
@@ -266,14 +268,14 @@ def handler(event, context):
                 use_debounce = True       # Rule 4: Lark-only rule, use 30m debounce
 
         if must_alert_now:
-            core.send_lark_notification(response_data, features)
+            core.send_lark_notification(response_data, features, alert_id=alert_id)
             core.update_lark_debounce_timestamp(str(user_code), str(rule_result.get("rule_id", "0")))
         elif use_debounce:
             suppress = core.should_suppress_lark(str(user_code), str(rule_result.get("rule_id", "0")))
             if suppress:
                 print("[TRADE_RISK_V2_FC] Lark alert suppressed by OTS debounce cache.")
             else:
-                core.send_lark_notification(response_data, features)
+                core.send_lark_notification(response_data, features, alert_id=alert_id)
 
         elapsed = time.perf_counter() - start_ts
         return _make_response(200, response_data)

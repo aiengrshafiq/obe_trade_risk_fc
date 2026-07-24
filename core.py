@@ -13,6 +13,7 @@ from functools import lru_cache
 from tablestore import OTSClient, RowExistenceExpectation, Condition, SingleColumnCondition, ComparatorType, Row, LogicalOperator, CompositeColumnCondition
 import tablestore
 import os
+import re
 #from tablestore import OTSClient, Row, Condition, RowExistenceExpectation
 
 import config as cfg
@@ -140,7 +141,12 @@ def load_trade_rules_strict():
     conn = get_db_conn()
     cur = conn.cursor()
     cur.execute(
-        "SELECT * FROM rt.risk_trade_rules_v2 WHERE status = 'ACTIVE' ORDER BY priority ASC"
+        """
+        SELECT r.*, t.template_text 
+        FROM rt.risk_trade_rules_v2 r 
+        LEFT JOIN rt.risk_alert_templates t ON r.template_id = t.template_id 
+        WHERE r.status = 'ACTIVE' ORDER BY r.priority ASC
+        """
     )
     rows = cur.fetchall()
     rules = [dict_factory(cur, row) for row in rows] if rows else []
@@ -534,36 +540,37 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
                 
             row_to_update = tablestore.Row(primary_key, update_attrs)
             
-            # Python SDK update_row returns (consumed, return_row)
-            _, return_row = client.update_row(
-                table_name, 
-                row_to_update, 
-                cond, 
-                return_type=tablestore.ReturnType.RT_AFTER_MODIFY
-            )
+            # Python SDK update_row (No return_type because RT_AFTER_MODIFY is not supported)
+            client.update_row(table_name, row_to_update, cond)
             
-            if should_flush and return_row:
-                # We won the 60s CAS. Read the exact incremented count and flush to Hologres.
-                exact_count = 1
-                if return_row.attribute_columns:
-                    for k, v, _ in return_row.attribute_columns:
-                        if k == "trigger_count":
-                            exact_count = int(v)
-                            break
-                
+            if should_flush:
                 # Deterministic UUID5 based on the High Water Mark tier
                 namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')
                 alert_id = str(uuid.uuid5(namespace, f"{user_code}_{rule_id}_{hwm_tier}"))
                 
                 conn = get_db_conn()
                 cur = conn.cursor()
+                
+                # RESTORED: Updating the feature_snapshot so the Dashboard shows the latest trade details.
+                # NATIVE INCREMENT: Using SQL to increment the count since OTS Python SDK can't return it.
+                # cur.execute(
+                #     """
+                #     UPDATE rt.risk_trade_alerts_v2 
+                #     SET trigger_count = trigger_count + 1, 
+                #         feature_snapshot = %s, 
+                #         updated_at = NOW() 
+                #     WHERE alert_id = %s
+                #     """,
+                #     (json.dumps(features, default=str), alert_id)
+                # )
                 cur.execute(
                     """
                     UPDATE rt.risk_trade_alerts_v2 
-                    SET trigger_count = %s, feature_snapshot = %s, updated_at = NOW() 
+                    SET trigger_count = trigger_count + 1, 
+                        feature_snapshot = %s 
                     WHERE alert_id = %s
                     """,
-                    (exact_count, json.dumps(features, default=str), alert_id)
+                    (json.dumps(features, default=str), alert_id)
                 )
                 conn.commit()
                 cur.close()
@@ -620,9 +627,10 @@ def evaluate_trade_rules(features, rules):
                     "alert_type": rule.get("alert_type", "Unknown Type"),
                     "narrative":  f"[Rule #{rule_id}] {rule.get('narrative')}",
                     "enforcement_actions": rule_actions,
-                    # Pass the tier info down so log_trade_alert can use it
                     "is_tiered": bool(target_feature),
-                    "current_tier": current_tier
+                    "current_tier": current_tier,
+                    "alert_group_name": rule.get("alert_group_name"),
+                    "template_text": rule.get("template_text")
                 }
         except Exception as exc:
             print(f"[URGENT DEBUG] AST eval failed for Rule #{rule.get('rule_id')}: {exc}")
@@ -676,13 +684,19 @@ def evaluate_trade_rules(features, rules):
 # Adds V2-specific fields: cancel rate, margin utilization,
 # opposite party concentration, funding income
 # ==========================
-def send_lark_notification(data, features):
-    if not cfg.LARK_WEBHOOK_URL:
-        return
+def send_lark_notification(data, features, alert_id=None):
     try:
         decision   = data.get("decision", "")
         rule_name  = data.get("rule_hit", "Unknown Rule")
         alert_type = data.get("alert_type", "Alert")
+        
+        template_text = data.get("template_text")
+        alert_group_name = data.get("alert_group_name")
+        
+        # 1. Resolve Webhook Routing
+        webhook_url = cfg.ALERT_GROUPS.get(alert_group_name) or cfg.ALERT_GROUPS.get("DEFAULT")
+        if not webhook_url:
+            return
 
         # Dynamic header colors based on action type
         color_map = {
@@ -691,132 +705,94 @@ def send_lark_notification(data, features):
             "Whitelist / Pass": "green"
         }
         header_color = color_map.get(decision, "blue")
+        
+        final_rendered_msg = ""
 
-        # Format enforcement actions for display
-        actions_list = data.get("enforcement_actions") or []
-        actions_str = ", ".join(actions_list) if actions_list else "None"
-
-        # Show correlated UIDs only for HOLD ALL decisions
-        correlated = (
-            features.get("correlated_account_uids", "None")
-            if "ALL" in decision
-            else "N/A"
-        )
-
-        # Core metrics
-        vol              = float(features.get("trading_volume", 0.0) or 0.0)
-        pnl              = float(features.get("net_pnl", 0.0) or 0.0)
-        fee              = float(features.get("trading_fees_paid", 0.0) or 0.0)
-        offset           = float(features.get("offset_ratio", 0.0) or 0.0)
-        rebate           = float(features.get("total_rebate", 0.0) or 0.0)
-        net_benefit      = float(features.get("net_benefit", 0.0) or 0.0)
-
-        # V2 new metrics
-        cancel_rate      = float(features.get("order_cancel_rate", 0.0) or 0.0)
-        margin_util      = float(features.get("margin_utilization_ratio", 0.0) or 0.0)
-        opp_conc         = float(features.get("opposite_party_concentration", 0.0) or 0.0)
-        funding_income   = float(features.get("funding_fee_income", 0.0) or 0.0)
-        cashback         = float(features.get("cashback_received", 0.0) or 0.0)
-        cancel_ms        = float(features.get("avg_order_lifetime_ms", 0.0) or 0.0)
-        current_symbol   = features.get("current_symbol_id", "N/A")
-        current_leverage = features.get("current_leverage", "N/A")
-        current_side     = {1: "Buy", 2: "Sell"}.get(features.get("current_order_side"), "N/A")
-        wallet_bal       = float(features.get("wallet_balance", 0.0) or 0.0)
-
-        card_content = {
-            "msg_type": "interactive",
-            "card": {
-                "config": {"wide_screen_mode": True},
-                "header": {
-                    "title": {
-                        "tag": "plain_text",
-                        "content": f"🚨 TRADE RISK V2: {alert_type} — {rule_name}"
+        # ==========================================
+        # 2A. NEW FLOW: Dynamic Markdown Template
+        # ==========================================
+        if template_text:
+            def replacer(match):
+                key = match.group(1)
+                val = features.get(key)
+                if val is None:
+                    val = data.get(key, "N/A")
+                return str(val)
+                
+            # Safely replace ${field_name} with snapshot values
+            final_rendered_msg = re.sub(r'\$\{([^}]+)\}', replacer, template_text)
+            
+            card_content = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"🚨 TRADE RISK V2: {alert_type} — {rule_name}"},
+                        "template": header_color
                     },
-                    "template": header_color
-                },
-                "elements": [
-                    # --- User Identity ---
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**User:**\n{data.get('user_code')}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Root User:**\n{data.get('root_user_code', 'N/A')}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Inviter:**\n{data.get('inviter_user_code', 'N/A')}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Txn ID:**\n{data.get('txn_id')}"}},
-                        ]
-                    },
-                    {"tag": "hr"},
-                    # --- Action & Enforcement Details ---
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Trigger Type:**\n{decision}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**System Actions:**\n{actions_str}"}},
-                        ]
-                    },
-                    {"tag": "hr"},
-                    # --- Trade Context ---
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Symbol ID:**\n{current_symbol}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Side:**\n{current_side}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Leverage:**\n{current_leverage}x"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Wallet Bal:**\n{wallet_bal:,.2f}"}},
-                        ]
-                    },
-                    {"tag": "hr"},
-                    # --- Core Trading Metrics ---
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Vol (USDT):**\n{vol:,.2f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Net P&L:**\n{pnl:,.2f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Fee Paid:**\n{fee:,.2f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Net Benefit:**\n{net_benefit:,.2f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Offset Ratio:**\n{offset:.4f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Total Rebate:**\n{rebate:,.2f}"}},
-                        ]
-                    },
-                    {"tag": "hr"},
-                    # --- V2 New Risk Signals ---
-                    {
-                        "tag": "div",
-                        "fields": [
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Cancel Rate:**\n{cancel_rate:.2%}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Avg Cancel ms:**\n{cancel_ms:,.0f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Margin Util:**\n{margin_util:.2%}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Opp Party Conc:**\n{opp_conc:.2%}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Funding Income:**\n{funding_income:,.2f}"}},
-                            {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Cashback:**\n{cashback:,.2f}"}},
-                        ]
-                    },
-                    {"tag": "hr"},
-                    # --- Correlated Accounts ---
-                    {
-                        "tag": "div",
-                        "text": {"tag": "lark_md", "content": f"**Correlated UIDs:**\n{correlated}"}
-                    },
-                    {"tag": "hr"},
-                    # --- Rule Details ---
-                    {
-                        "tag": "div",
-                        "text": {
-                            "tag": "lark_md",
-                            "content": f"**Triggered Rule:**\n{rule_name}\n\n**Reasoning:**\n{data.get('narrative', '')}"
-                        }
-                    },
-                ]
+                    "elements": [
+                        {"tag": "markdown", "content": final_rendered_msg}
+                    ]
+                }
             }
-        }
 
-        req = urllib.request.Request(
-            cfg.LARK_WEBHOOK_URL,
-            data=json.dumps(card_content).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
-        )
+        # ==========================================
+        # 2B. LEGACY FLOW: Default Hardcoded Card
+        # ==========================================
+        else:
+            actions_list = data.get("enforcement_actions") or []
+            actions_str = ", ".join(actions_list) if actions_list else "None"
+            correlated = features.get("correlated_account_uids", "None") if "ALL" in decision else "N/A"
+            
+            vol = float(features.get("trading_volume", 0.0) or 0.0)
+            pnl = float(features.get("net_pnl", 0.0) or 0.0)
+            
+            final_rendered_msg = f"Legacy fallback triggered for {rule_name}. Vol: {vol}, PnL: {pnl}"
+            
+            card_content = {
+                "msg_type": "interactive",
+                "card": {
+                    "config": {"wide_screen_mode": True},
+                    "header": {
+                        "title": {"tag": "plain_text", "content": f"🚨 TRADE RISK V2: {alert_type} — {rule_name}"},
+                        "template": header_color
+                    },
+                    "elements": [
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**User:**\n{data.get('user_code')}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Txn ID:**\n{data.get('txn_id')}"}},
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {
+                            "tag": "div",
+                            "fields": [
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**Trigger Type:**\n{decision}"}},
+                                {"is_short": True,  "text": {"tag": "lark_md", "content": f"**System Actions:**\n{actions_str}"}},
+                            ]
+                        },
+                        {"tag": "hr"},
+                        {"tag": "div", "text": {"tag": "lark_md", "content": f"**Triggered Rule:**\n{rule_name}\n\n**Reasoning:**\n{data.get('narrative', '')}"}}
+                    ]
+                }
+            }
+
+        # 3. Fire Webhook
+        req = urllib.request.Request(webhook_url, data=json.dumps(card_content).encode("utf-8"), headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=3)
-        # print(f"[TRADE_RISK_V2_FC] Lark notification sent successfully")
+        
+        # 4. Audit Log (Reconciliation)
+        if alert_id:
+            try:
+                conn = get_db_conn()
+                cur = conn.cursor()
+                cur.execute("UPDATE rt.risk_trade_alerts_v2 SET rendered_message = %s WHERE alert_id = %s", (final_rendered_msg, str(alert_id)))
+                conn.commit()
+                cur.close()
+            except Exception as e:
+                print(f"[URGENT DEBUG] Failed to log rendered message to Hologres: {e}")
 
     except Exception as e:
         print(f"[TRADE_RISK_V2_FC] Lark notification error: {e}")

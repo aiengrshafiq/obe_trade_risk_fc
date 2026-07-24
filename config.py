@@ -21,3 +21,13 @@ RISK_GATEWAY_URL = os.getenv("RISK_GATEWAY_URL", "http://alb-dsg2mz9eq4ip750s4f.
 RISK_GATEWAY_API_KEY = os.getenv("RISK_GATEWAY_API_KEY", "")
 RISK_GATEWAY_SECRET = os.getenv("RISK_GATEWAY_SECRET", "")
 RISK_GATEWAY_TIMEOUT = int(os.getenv("RISK_GATEWAY_TIMEOUT", "3")) # strict 3 second timeout
+
+# --- ALERT ROUTING CONFIG ---
+# Logical names mapped to physical webhook URLs. 
+# UI Operators will select "TRADE_CORE_1" instead of pasting raw URLs.
+ALERT_GROUPS = {
+    "DEFAULT": LARK_WEBHOOK_URL,
+    "TRADE_CORE_1": "https://open.larksuite.com/open-apis/bot/v2/hook/...",
+    "TRADE_ESCALATION": "https://open.larksuite.com/open-apis/bot/v2/hook/...",
+    "TRADE_WHALES": "https://open.larksuite.com/open-apis/bot/v2/hook/..."
+}
