@@ -23,11 +23,12 @@ RISK_GATEWAY_SECRET = os.getenv("RISK_GATEWAY_SECRET", "")
 RISK_GATEWAY_TIMEOUT = int(os.getenv("RISK_GATEWAY_TIMEOUT", "3")) # strict 3 second timeout
 
 # --- ALERT ROUTING CONFIG ---
-# Logical names mapped to physical webhook URLs. 
-# UI Operators will select "TRADE_CORE_1" instead of pasting raw URLs.
+# --- ALERT ROUTING CONFIG (Trade) ---
 ALERT_GROUPS = {
     "DEFAULT": LARK_WEBHOOK_URL,
-    "TRADE_CORE_1": "https://open.larksuite.com/open-apis/bot/v2/hook/...",
-    "TRADE_ESCALATION": "https://open.larksuite.com/open-apis/bot/v2/hook/...",
-    "TRADE_WHALES": "https://open.larksuite.com/open-apis/bot/v2/hook/..."
+    "PROFIT_AND_TRADING_RISK": "https://open.larksuite.com/open-apis/bot/v2/hook/7e394a25-7829-4d78-8967-ed52df3e880a",
+    "ACCOUNT_SECURITY_RISK": "https://open.larksuite.com/open-apis/bot/v2/hook/5a701cc0-06aa-44e6-9407-a53c5cb415ec",
+    "MARKET_MANIPULATION_WASHTRADING": "https://open.larksuite.com/open-apis/bot/v2/hook/e6ec276a-11a7-45e6-ac65-51c29374cf85",
+    "LINKED_ACCOUNT_COORDINATION": "https://open.larksuite.com/open-apis/bot/v2/hook/e5c26112-caba-482b-9182-dd79102ce819",
+    "REWARD_ARBITRAGE_ABUSE": "https://open.larksuite.com/open-apis/bot/v2/hook/9e77de7d-577c-4ca8-bc3a-bb75d3de4d41"
 }
