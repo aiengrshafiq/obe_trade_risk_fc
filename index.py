@@ -253,10 +253,13 @@ def handler(event, context):
         decision = rule_result.get("decision", "")
         already_active = gateway_res.get("already_active", False)
         is_whitelist = decision.strip() in ("Whitelist / Pass", "PASS")
+        db_insert_failed = not bool(alert_id)
 
         if not is_whitelist:
             if has_automated_actions:
-                if not api_success and not is_shadow:
+                if db_insert_failed:
+                    use_debounce = True  # DB contention: don't treat missing alert_id as API failure
+                elif not api_success and not is_shadow:
                     must_alert_now = True # Rule 3: Always alert on API failure
                 elif newly_applied:
                     must_alert_now = True # Rule 2: Always alert when NEW restriction is applied
