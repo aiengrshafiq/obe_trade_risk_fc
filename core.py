@@ -512,7 +512,8 @@ def _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_v
     # ==========================================
     # SCENARIO B: Crossing a New Tier
     # ==========================================
-    if current_tier > hwm_tier:
+    is_escalation = (current_tier > hwm_tier) if (step_size > 0) else (current_tier < hwm_tier)
+    if is_escalation:
         # 1. We return True to let the FC know it MUST alert. 
         # The FC will handle the idempotent DB insert FIRST, then call a callback to update OTS.
         return True, current_tier, hwm_tier
@@ -605,7 +606,7 @@ def evaluate_trade_rules(features, rules):
                 rule_id = rule.get("rule_id")
                 current_tier = 0
                 
-                if target_feature and step_size and step_size > 0:
+                if target_feature and step_size and step_size != 0:
                     feature_val = safe_locals.get(target_feature, 0.0)
                     should_alert, current_tier, _ = _process_tier_logic(user_code, rule_id, target_feature, step_size, feature_val, features)
                     
