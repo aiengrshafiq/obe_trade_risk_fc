@@ -691,12 +691,22 @@ def send_lark_notification(data, features, alert_id=None):
         # 2A. NEW FLOW: Dynamic Markdown Template
         # ==========================================
         if template_text:
+            from datetime import datetime, timezone
+            
+            # 1. Base context is the raw features directly from the database table
+            template_context = dict(features or {})
+            
+            # 2. Inject ONLY the metadata fields that don't exist in the DB schema
+            template_context.update({
+                "rule_name": rule_name,
+                "verdict": decision,
+                "engine_type": "TR",
+                "trigger_time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+            })
+
             def replacer(match):
-                key = match.group(1)
-                val = features.get(key)
-                if val is None:
-                    val = data.get(key, "N/A")
-                return str(val)
+                val = template_context.get(match.group(1))
+                return "N/A" if val is None else str(val)
                 
             final_rendered_msg = re.sub(r'\$\{([^}]+)\}', replacer, template_text)
             
