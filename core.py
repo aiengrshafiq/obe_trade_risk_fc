@@ -653,45 +653,6 @@ def evaluate_trade_rules(features, rules):
 
     return {"triggered": False}
 
-# def evaluate_trade_rules(features, rules):
-#     """
-#     Evaluates all active rules in priority order.
-#     Returns first triggered rule result or triggered=False.
-#     """
-#     safe_locals = {
-#         k: _normalize_feature_value(k, v)
-#         for k, v in (features or {}).items()
-#     }
-
-#     for rule in rules or []:
-#         try:
-#             expr = rule.get("logic_expression", "")
-#             tree = _compile_rule_expr(expr)
-#             if tree and bool(_eval_ast(tree, safe_locals)):
-#                 # print(f"[TRADE_RISK_V2_FC] Rule triggered: #{rule.get('rule_id')} — {rule.get('rule_name')}")
-#                 rule_actions = rule.get("enforcement_actions")
-#                 if isinstance(rule_actions, str):
-#                     try:
-#                         rule_actions = json.loads(rule_actions)
-#                     except:
-#                         rule_actions = []
-#                 elif not isinstance(rule_actions, list):
-#                     rule_actions = []
-#                 return {
-#                     "triggered":  True,
-#                     "decision":   (rule.get("action") or "Human Monitoring").strip(),
-#                     "rule_id":    rule.get("rule_id"),
-#                     "rule_name":  rule.get("rule_name"),
-#                     "alert_type": rule.get("alert_type", "Unknown Type"),
-#                     "narrative":  f"[Rule #{rule.get('rule_id')}] {rule.get('narrative')}",
-#                     "enforcement_actions": rule_actions,
-#                 }
-#         except Exception as exc:
-#             # print(f"[TRADE_RISK_V2_FC] AST eval failed Rule #{rule.get('rule_id')} "
-#             #       f"({rule.get('rule_name')}): {exc}")
-#             continue
-
-#     return {"triggered": False}
 
 
 # ==========================
