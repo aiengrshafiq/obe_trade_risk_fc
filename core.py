@@ -592,7 +592,14 @@ def evaluate_trade_rules(features, rules):
 
     user_code = features.get("user_code")
 
-    for rule in rules or []:
+    # CRITICAL FIX: Ensure rules are evaluated in strict priority order (lowest number = highest priority)
+    # Default to 100 if priority is missing or None to push unprioritized rules to the back
+    sorted_rules = sorted(
+        rules or [],
+        key=lambda r: float(r.get("priority") if r.get("priority") is not None else 100)
+    )
+
+    for rule in sorted_rules:
         try:
             expr = rule.get("logic_expression", "")
             tree = _compile_rule_expr(expr)
