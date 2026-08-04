@@ -360,6 +360,13 @@ def _normalize_feature_value(k, v):
     - wallet_ prefix for balance fields
     - volatility suffix for numeric fields
     """
+    if isinstance(v, str):
+        v_lower = v.strip().lower()
+        if v_lower in ('t', 'true', '1'):
+            return True
+        if v_lower in ('f', 'false', '0'):
+            return False
+
     if v is None:
         return 0.0
     key = (k or "").lower()
