@@ -973,24 +973,34 @@ def execute_gateway_actions(user_code, rule_result, alert_id):
 
 
 def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_id):
+    import os
+
+    # 1. Safely resolve credentials (check env vars first, fallback to config.py)
+    gw_secret = os.environ.get('RISK_GATEWAY_SECRET') or getattr(cfg, 'RISK_GATEWAY_SECRET', '')
+    gw_key = os.environ.get('RISK_GATEWAY_API_KEY') or getattr(cfg, 'RISK_GATEWAY_API_KEY', '')
+    gw_url = os.environ.get('RISK_GATEWAY_URL') or getattr(cfg, 'RISK_GATEWAY_URL', '')
+
+    env_shadow = os.environ.get('ENABLE_AUTOMATED_ACTIONS')
+    if env_shadow is not None:
+        is_shadow = str(env_shadow).strip().lower() not in ('true', '1', 'yes')
+    else:
+        is_shadow = not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)
 
     # CRITICAL: Must be deterministic for HMAC signature matching
     payload_bytes = json.dumps(payload, sort_keys=True, separators=(',', ':')).encode("utf-8")
 
     signature = hmac.new(
-        key=getattr(cfg, 'RISK_GATEWAY_SECRET', '').encode("utf-8"),
+        key=gw_secret.encode("utf-8"),
         msg=payload_bytes,
         digestmod=hashlib.sha256
     ).hexdigest()
 
     headers = {
         "Content-Type": "application/json",
-        "X-API-Key": getattr(cfg, 'RISK_GATEWAY_API_KEY', ''),
+        "X-API-Key": gw_key,
         "X-Signature": signature,
         "Host": "prod-admin-in.onebullex.com"
     }
-
-    is_shadow = not getattr(cfg, 'ENABLE_AUTOMATED_ACTIONS', False)
     http_status = None
     response_body = ""
     latency = 0
@@ -998,8 +1008,9 @@ def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_
     if not is_shadow:
         start_t = time.perf_counter()
         try:
-            req = urllib.request.Request(getattr(cfg, 'RISK_GATEWAY_URL', ''), data=payload_bytes, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3)) as response:
+            req = urllib.request.Request(gw_url, data=payload_bytes, headers=headers, method="POST")
+            gw_timeout = int(os.environ.get('RISK_GATEWAY_TIMEOUT') or getattr(cfg, 'RISK_GATEWAY_TIMEOUT', 3))
+            with urllib.request.urlopen(req, timeout=gw_timeout) as response:
                 http_status = response.getcode()
                 response_body = response.read().decode("utf-8")
         except urllib.error.HTTPError as e:
@@ -1021,7 +1032,7 @@ def _post_gateway_group(user_code, rule_result, alert_id, payload, source_order_
             (audit_id, alert_id, user_code, rule_id, source_order_id, api_endpoint, payload_sent, hmac_signature, http_status_code, response_body, latency_ms, is_shadow_mode, created_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
             """,
-            (audit_id, alert_id, str(user_code), rule_result.get("rule_id", 0), source_order_id, getattr(cfg, 'RISK_GATEWAY_URL', ''), json.dumps(payload), signature, http_status, response_body, latency, is_shadow)
+            (audit_id, alert_id, str(user_code), rule_result.get("rule_id", 0), source_order_id, gw_url, json.dumps(payload), signature, http_status, response_body, latency, is_shadow)
         )
         conn.commit()
         cur.close()

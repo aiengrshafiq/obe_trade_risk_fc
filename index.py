@@ -255,7 +255,11 @@ def handler(event, context):
         is_whitelist = decision.strip() in ("Whitelist / Pass", "PASS")
         db_insert_failed = not bool(alert_id)
 
-        if not is_whitelist:
+        if is_whitelist:
+            # If the whitelist rule explicitly requests a Lark alert, route it through debounce
+            if "LARK_ALERT" in enforcement_actions:
+                use_debounce = True
+        else:
             if has_automated_actions:
                 if db_insert_failed:
                     use_debounce = True  # DB contention: don't treat missing alert_id as API failure
