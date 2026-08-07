@@ -145,13 +145,15 @@ def load_trade_rules_strict():
         SELECT r.*, t.template_text 
         FROM rt.risk_trade_rules_v2 r 
         LEFT JOIN rt.risk_alert_templates t ON r.template_id = t.template_id 
-        WHERE r.status = 'ACTIVE' ORDER BY r.priority ASC
+        WHERE r.status = 'ACTIVE'
+          AND r.event_scope IS NULL
+        ORDER BY r.priority ASC
         """
     )
     rows = cur.fetchall()
     rules = [dict_factory(cur, row) for row in rows] if rows else []
     cur.close()
-    # print(f"[TRADE_RISK_V2_FC] Rules loaded from DB: {len(rules)} active rules")
+    print(f"[TRADE_RISK_V2_FC] Rules loaded from DB: {len(rules)} active rules")
     return rules
 
 
