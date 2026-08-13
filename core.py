@@ -697,6 +697,40 @@ def send_lark_notification(data, features, alert_id=None):
             
             # 1. Base context is the raw features directly from the database table
             template_context = dict(features or {})
+
+            # Parse rule_metadata JSON into a Markdown list of hedge matches
+            template_context["formatted_hedge_matches"] = "No match details available."
+            try:
+                import json
+                raw_meta = template_context.get("rule_metadata")
+                if raw_meta:
+                    matches = json.loads(raw_meta) if isinstance(raw_meta, str) else raw_meta
+                    if isinstance(matches, list) and matches:
+                        side_map = {1: "Buy", 2: "Sell", "1": "Buy", "2": "Sell"}
+                        lines = []
+                        for m in matches:
+                            if not isinstance(m, dict):
+                                continue
+                            
+                            # FIXED: Keys must exactly match Flink's JSON output
+                            uid = m.get("matched_uid", "N/A")
+                            order_id = m.get("matched_order_id", "N/A")
+                            side = side_map.get(m.get("matched_side"), "N/A")
+                            qty = m.get("matched_qty", "N/A")
+                            
+                            try:
+                                sim_pct = float(m.get("similarity_ratio") or 0) * 100
+                                sim_str = f"{sim_pct:.2f}%"
+                            except (TypeError, ValueError):
+                                sim_str = "N/A"
+                                
+                            lines.append(
+                                f"- **UID:** {uid} | **Order ID:** {order_id} | **Side:** {side} | **Quantity:** {qty} | **Similarity:** {sim_str}"
+                            )
+                        if lines:
+                            template_context["formatted_hedge_matches"] = "\n".join(lines)
+            except (json.JSONDecodeError, TypeError, ValueError, AttributeError):
+                template_context["formatted_hedge_matches"] = "No match details available."
             
             # 2. Inject ONLY the metadata fields that don't exist in the DB schema
             template_context.update({
