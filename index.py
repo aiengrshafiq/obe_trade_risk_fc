@@ -76,8 +76,8 @@ def handler(event, context):
     if kill_switch.get_kill_switch_action() == kill_switch.ACTION_HOLD:
         print("[TRADE_RISK_V2_FC] GLOBAL KILL SWITCH ENGAGED — Risk Engine standing down.")
         return _make_response(200, {
-            "user_code": str(user_code) if 'user_code' in locals() else "UNKNOWN",
-            "txn_id": str(txn_id_input) if 'txn_id_input' in locals() else "UNKNOWN",
+            "user_code": "UNKNOWN",
+            "txn_id": "UNKNOWN",
             "decision": "PASS", # CRITICAL: Fail-open to protect exchange liquidity
             "reason": "RISK_ENGINE_KILLED",
             "message": "Enforcement halted due to Global Kill Switch.",
@@ -252,6 +252,7 @@ def handler(event, context):
 
         decision = rule_result.get("decision", "")
         already_active = gateway_res.get("already_active", False)
+        is_shadow = gateway_res.get("shadow_mode", False)
         is_whitelist = decision.strip() in ("Whitelist / Pass", "PASS")
         db_insert_failed = not bool(alert_id)
 
