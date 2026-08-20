@@ -36,12 +36,15 @@ def get_db_conn():
                 if status == psyext.TRANSACTION_STATUS_INERROR:
                     _DB_CONN.rollback()
                     return _DB_CONN
-                if status == psyext.TRANSACTION_STATUS_UNKNOWN:
+                elif status == psyext.TRANSACTION_STATUS_UNKNOWN:
                     try:
                         _DB_CONN.close()
                     except Exception:
                         pass
                     _DB_CONN = None
+                elif status == psyext.TRANSACTION_STATUS_INTRANS:
+                    _DB_CONN.rollback()
+                    return _DB_CONN
                 else:
                     return _DB_CONN
             else:
@@ -57,6 +60,7 @@ def get_db_conn():
         host=cfg.DB_HOST, port=cfg.DB_PORT, database=cfg.DB_NAME,
         user=cfg.DB_USER, password=cfg.DB_PASS, connect_timeout=3,
     )
+    _DB_CONN.autocommit = True
     return _DB_CONN
 
 
@@ -868,19 +872,22 @@ def _pick_source_order_id(user_code, action, engine="TR"):
     try:
         conn = get_db_conn()                 # shared Hologres conn (do NOT close)
         cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT status, source_order_id
-            FROM merchent_bullex.risk_permission_lock
-            WHERE uid = %s AND action = %s AND source = 'PHALANX'
-              AND (source_order_id = %s OR source_order_id LIKE %s)
-            ORDER BY create_at DESC
-            LIMIT 1
-            """,
-            (int(user_code) if str(user_code).isdigit() else user_code, action, base, base + '-v%'),
-        )
-        row = cur.fetchone()
-        cur.close()
+        try:
+            cur.execute(
+                """
+                SELECT status, source_order_id
+                FROM merchent_bullex.risk_permission_lock
+                WHERE uid = %s AND action = %s AND source = 'PHALANX'
+                  AND (source_order_id = %s OR source_order_id LIKE %s)
+                ORDER BY create_at DESC
+                LIMIT 1
+                """,
+                (int(user_code) if str(user_code).isdigit() else user_code, action, base, base + '-v%'),
+            )
+            row = cur.fetchone()
+        finally:
+            if 'cur' in locals() and cur and not cur.closed:
+                cur.close()
 
         if row is None:
             return base + "-v1"                      # never locked before
